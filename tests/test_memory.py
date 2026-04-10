@@ -64,9 +64,9 @@ def install_fake_hf_modules(monkeypatch: pytest.MonkeyPatch) -> None:
 
     class AutoModelForCausalLM:
         @staticmethod
-        def from_pretrained(model_name: str, torch_dtype: torch.dtype, **kwargs) -> FakeBaseModel:
+        def from_pretrained(model_name: str, dtype: torch.dtype, **kwargs) -> FakeBaseModel:
             assert model_name == "fake/model"
-            assert torch_dtype == torch.float16
+            assert dtype == torch.float16
             assert "trust_remote_code" in kwargs
             assert "low_cpu_mem_usage" in kwargs
             return FakeBaseModel()

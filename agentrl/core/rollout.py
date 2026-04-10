@@ -232,8 +232,6 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": getattr(self.tokenizer, "eos_token_id", None),
         }
-        if self.config.do_sample and self.rng is not None:
-            generate_kwargs["generator"] = self.rng
         with torch.no_grad():
             generated = generation_model.generate(**generate_kwargs)
 

@@ -57,7 +57,7 @@ class SharedWeightLayout:
 
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=self.torch_dtype,
+            dtype=self.torch_dtype,
             trust_remote_code=trust_remote_code,
             low_cpu_mem_usage=True,
         )
@@ -146,12 +146,23 @@ class SharedWeightLayout:
 
     @contextmanager
     def _sdpa_context(self) -> Iterator[None]:
-        """Prefer FlashAttention-backed SDPA and fall back to math safely."""
+        """Apply the configured SDPA policy.
+
+        `auto` deliberately lets PyTorch/Transformers choose the backend. This
+        avoids forcing a FlashAttention path that can be invalid for models or
+        masks that require a different kernel.
+        """
 
         try:
             from torch.nn.attention import SDPBackend, sdpa_kernel
         except ImportError:
             self.active_attention_backend = "math"
+            with nullcontext():
+                yield
+            return
+
+        if self.sdpa_backend == "auto":
+            self.active_attention_backend = "auto"
             with nullcontext():
                 yield
             return
@@ -168,11 +179,6 @@ class SharedWeightLayout:
                 yield
             return
 
-        try:
-            self.active_attention_backend = "flash_attention"
-            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                yield
-        except RuntimeError:
-            self.active_attention_backend = "math"
-            with sdpa_kernel(SDPBackend.MATH):
-                yield
+        self.active_attention_backend = "flash_attention"
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            yield

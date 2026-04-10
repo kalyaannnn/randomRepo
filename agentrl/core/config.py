@@ -38,7 +38,7 @@ class GRPOConfig:
         "up_proj",
         "down_proj",
     )
-    use_gradient_checkpointing: bool = True
+    use_gradient_checkpointing: bool = False
     use_continuous_batching: bool = True
     use_speculative_decoding: bool = False
     draft_model_name: str | None = None

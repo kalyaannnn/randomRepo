@@ -50,7 +50,7 @@ def test_config_defaults_match_prompt_surface() -> None:
     assert config.lr == 1e-5
     assert config.steps == 500
     assert config.use_lora is True
-    assert config.use_gradient_checkpointing is True
+    assert config.use_gradient_checkpointing is False
     assert config.use_continuous_batching is True
     assert config.use_speculative_decoding is False
     assert config.max_episode_steps == 8

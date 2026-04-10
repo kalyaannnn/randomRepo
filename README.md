@@ -48,6 +48,7 @@ python -m examples.train_math --model Qwen/Qwen2.5-1.5B-Instruct --steps 5
 ## Current Constraints
 
 - AgentRL currently requires `use_lora=True`; full-model GRPO is not wired yet.
+- Gradient checkpointing is opt-in. Enable it only when VRAM pressure requires it.
 - `prefill_chunk_size` is implemented at the mixin level, but the live generation paths are still converging on one long-prompt strategy.
 - The framework is single-device only.
 
