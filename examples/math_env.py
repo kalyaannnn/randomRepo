@@ -10,6 +10,7 @@ from agentrl import BaseEnvironment, BaseVerifier
 
 
 _FINAL_ANSWER_RE = re.compile(r"final answer:\s*(-?\d+)", re.IGNORECASE)
+_STRICT_FINAL_ANSWER_RE = re.compile(r"^\s*Final answer:\s*(-?\d+)\s*$", re.IGNORECASE)
 _INTEGER_RE = re.compile(r"-?\d+")
 
 
@@ -109,10 +110,17 @@ class MathVerifier(BaseVerifier):
         """Return `1.0` on exact integer match and `0.0` otherwise."""
 
         answer = int(env_state["answer"])
-        extracted = self._extract_answer(response)
+        split = str(env_state.get("split", "train"))
+        extracted = self._extract_answer(response, strict=(split == "smoke"))
         return 1.0 if extracted == answer else 0.0
 
-    def _extract_answer(self, response: str) -> int | None:
+    def _extract_answer(self, response: str, strict: bool = False) -> int | None:
+        if strict:
+            strict_match = _STRICT_FINAL_ANSWER_RE.fullmatch(response)
+            if strict_match is None:
+                return None
+            return int(strict_match.group(1))
+
         match = _FINAL_ANSWER_RE.search(response)
         if match is not None:
             return int(match.group(1))

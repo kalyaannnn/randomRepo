@@ -79,3 +79,13 @@ def test_smoke_split_uses_easy_builtin_problems() -> None:
 
     assert "Reply with exactly one line and nothing else" in prompt
     assert answer in {2, 3, 4, 5, 6}
+
+
+def test_smoke_verifier_requires_exact_one_line_format() -> None:
+    verifier = MathVerifier()
+
+    strict_state = {"answer": 6, "split": "smoke"}
+
+    assert verifier.verify("Final answer: 6", strict_state) == 1.0
+    assert verifier.verify("6\nThe answer is 6.", strict_state) == 0.0
+    assert verifier.verify("6Human: Solve the following equation", strict_state) == 0.0
