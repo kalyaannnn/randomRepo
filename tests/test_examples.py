@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 from examples.bootstrap_gsm8k_subset import main as bootstrap_gsm8k_main
 from examples.benchmark_gsm8k_subset import main as benchmark_gsm8k_main
-from examples import benchmark_gsm8k_subset, bootstrap_gsm8k_subset, train_math
+from examples.eval_gsm8k_subset import main as eval_gsm8k_main
+from examples import benchmark_gsm8k_subset, bootstrap_gsm8k_subset, eval_gsm8k_subset, train_math
 from examples.gsm8k_subset import (
     GSM8KProblem,
     GSM8KSubsetEnvironment,
@@ -418,3 +419,115 @@ def test_bootstrap_gsm8k_subset_uses_public_api_shape(monkeypatch, tmp_path) -> 
     assert captured["samples"] == [("Problem: 2 + 2", "Final answer: 4")]
     assert captured["epochs"] == 2
     assert captured["adapter_dir"] == str(tmp_path / "adapter")
+
+
+def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:
+    class StubEnvironment:
+        dataset_name = "gsm8k"
+        dataset_config_name = "main"
+
+        def __init__(self, split, subset_size, max_question_words, curriculum):
+            self.split = split
+            self.subset_size = subset_size
+            self.max_question_words = max_question_words
+            self.curriculum = curriculum
+
+        def problems(self):
+            return [GSM8KProblem("What is 2 + 2?", 4, "2 + 2 = 4\n#### 4")]
+
+        @staticmethod
+        def _render_prompt(question):
+            return f"Prompt: {question}"
+
+    class StubVerifier:
+        def __init__(self, reward_mode):
+            self.reward_mode = reward_mode
+
+        def verify(self, response, env_state):
+            del env_state
+            return 1.0 if response.strip() == "Final answer: 4" else 0.0
+
+    class StubTokenizer:
+        pad_token_id = 0
+        eos_token_id = 99
+        eos_token = "<eos>"
+
+        def __call__(self, prompt, return_tensors, add_special_tokens):
+            del prompt, return_tensors, add_special_tokens
+            import torch
+
+            return {
+                "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+                "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            }
+
+        def decode(self, response_ids, skip_special_tokens):
+            del response_ids, skip_special_tokens
+            return "Final answer: 4"
+
+    class StubModel:
+        config = SimpleNamespace(use_cache=False)
+
+        def eval(self):
+            return None
+
+        def generate(self, **kwargs):
+            del kwargs
+            import torch
+
+            return torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+
+    class StubLayout:
+        def __init__(self, **kwargs):
+            self.device = "cpu"
+            self.model = StubModel()
+
+    monkeypatch.setattr(eval_gsm8k_subset, "GSM8KSubsetEnvironment", StubEnvironment)
+    monkeypatch.setattr(eval_gsm8k_subset, "GSM8KSubsetVerifier", StubVerifier)
+    monkeypatch.setattr(eval_gsm8k_subset, "SharedWeightLayout", StubLayout)
+    monkeypatch.setitem(
+        sys.modules,
+        "peft",
+        SimpleNamespace(LoraConfig=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoTokenizer=SimpleNamespace(
+                from_pretrained=lambda *args, **kwargs: StubTokenizer()
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_gsm8k_subset.py",
+            "--model",
+            "fake/model",
+            "--init-adapter-path",
+            "./adapter",
+            "--output-dir",
+            str(tmp_path / "eval"),
+            "--split",
+            "test",
+            "--subset-size",
+            "16",
+            "--max-question-words",
+            "50",
+            "--curriculum",
+            "standard",
+            "--max-new-tokens",
+            "16",
+        ],
+    )
+
+    eval_gsm8k_main()
+
+    summary = (tmp_path / "eval" / "summary.json").read_text(encoding="utf-8")
+    predictions = (tmp_path / "eval" / "predictions.jsonl").read_text(encoding="utf-8")
+
+    assert '"exact_match_rate": 1.0' in summary
+    assert '"subset_size": 1' in summary
+    assert '"reward": 1.0' in predictions

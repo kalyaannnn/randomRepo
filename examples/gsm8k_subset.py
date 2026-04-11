@@ -116,6 +116,11 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
             for problem in self._problems
         ]
 
+    def problems(self) -> list[GSM8KProblem]:
+        """Return the retained benchmark problems in their filtered order."""
+
+        return list(self._problems)
+
     def _load_problems(self) -> list[GSM8KProblem]:
         dataset = self._load_dataset_split()
         filtered: list[GSM8KProblem] = []
