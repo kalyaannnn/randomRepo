@@ -65,6 +65,7 @@ class GRPOConfig:
     output_dir: str = "./checkpoints"
     jsonl_metrics_name: str = "metrics.jsonl"
     checkpoint_prefix: str = "checkpoint"
+    init_adapter_path: str | None = None
     torch_compile: bool = False
     sdpa_backend: str = "auto"
     optimizer_name: str = "adamw"
@@ -110,6 +111,8 @@ class GRPOConfig:
             raise ConfigurationError("debug_temperature must be 0.0 for deterministic replay.")
         if self.max_prompt_tokens is not None and self.max_prompt_tokens <= 0:
             raise ConfigurationError("max_prompt_tokens must be > 0 when provided.")
+        if self.init_adapter_path is not None and not self.init_adapter_path.strip():
+            raise ConfigurationError("init_adapter_path must be a non-empty string when provided.")
         if self.chunk_size is not None and self.chunk_size <= 0:
             raise ConfigurationError("chunk_size must be > 0 when provided.")
         if self.max_grad_norm <= 0:

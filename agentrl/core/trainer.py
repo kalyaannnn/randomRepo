@@ -291,6 +291,7 @@ class GRPOTrainer:
             device=self._resolve_device(),
             trust_remote_code=self.config.trust_remote_code,
             sdpa_backend=self.config.sdpa_backend,
+            adapter_path=self.config.init_adapter_path,
         )
 
     def _build_rollout_orchestrator(self, draft_model: Any | None = None) -> RolloutOrchestrator:

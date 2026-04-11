@@ -82,12 +82,7 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
         """Return the next GSM8K prompt formatted for strict answer checking."""
 
         self._current_problem = self._rng.choice(self._problems)
-        return (
-            "Solve the following GSM8K math word problem.\n"
-            "Reply with exactly one line and nothing else:\n"
-            "Final answer: <integer>\n\n"
-            f"Problem: {self._current_problem.question}"
-        )
+        return self._render_prompt(self._current_problem.question)
 
     def step(self, action: str) -> tuple[str, bool]:
         """Mark the single-turn episode as complete."""
@@ -109,6 +104,17 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
             "dataset": self.dataset_name,
             "dataset_config_name": self.dataset_config_name,
         }
+
+    def supervised_samples(self) -> list[tuple[str, str]]:
+        """Return SFT prompt/target pairs aligned with the runtime prompt format."""
+
+        return [
+            (
+                self._render_prompt(problem.question),
+                f"Final answer: {problem.answer}",
+            )
+            for problem in self._problems
+        ]
 
     def _load_problems(self) -> list[GSM8KProblem]:
         dataset = self._load_dataset_split()
@@ -141,6 +147,15 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
                 f"max_question_words={self.max_question_words} and curriculum='{self.curriculum}'."
             )
         return filtered[: self.subset_size]
+
+    @staticmethod
+    def _render_prompt(question: str) -> str:
+        return (
+            "Solve the following GSM8K math word problem.\n"
+            "Reply with exactly one line and nothing else:\n"
+            "Final answer: <integer>\n\n"
+            f"Problem: {question}"
+        )
 
     def _load_dataset_split(self) -> list[dict[str, Any]]:
         try:

@@ -60,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["shaped", "strict"],
         help="Training reward mode. Use 'strict' for exact-match evaluation runs.",
     )
+    parser.add_argument(
+        "--init-adapter-path",
+        default=None,
+        help="Optional LoRA adapter directory from a previous SFT bootstrap run.",
+    )
     return parser
 
 
@@ -75,6 +80,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         output_dir=args.output_dir,
         replay_every=args.replay_every,
+        init_adapter_path=args.init_adapter_path,
     )
     trainer = GRPOTrainer(
         config=config,

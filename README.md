@@ -51,6 +51,19 @@ exact-match evaluation, switch back to `--reward-mode strict`.
 Example:
 
 ```bash
+python -m examples.bootstrap_gsm8k_subset \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --epochs 1 \
+  --batch-size 4 \
+  --subset-size 128 \
+  --max-question-words 45 \
+  --curriculum easy \
+  --adapter-dir ./bootstrap_gsm8k_adapter
+```
+
+Then launch GRPO from that saved adapter:
+
+```bash
 python -m examples.benchmark_gsm8k_subset \
   --model Qwen/Qwen2.5-1.5B-Instruct \
   --steps 10 \
@@ -61,6 +74,7 @@ python -m examples.benchmark_gsm8k_subset \
   --max-question-words 45 \
   --curriculum easy \
   --reward-mode shaped \
+  --init-adapter-path ./bootstrap_gsm8k_adapter \
   --split train \
   --output-dir ./checkpoints_gsm8k_subset
 ```
@@ -69,7 +83,8 @@ Recommended progression:
 
 - use `smoke` to verify your runtime and reward pipeline
 - use `easy` and `train` to check that a small model gets non-degenerate rewards
-- use `examples.benchmark_gsm8k_subset` as the first realistic benchmark harness
+- use `examples.bootstrap_gsm8k_subset` to warm-start a real GSM8K subset
+- use `examples.benchmark_gsm8k_subset` as the first realistic GRPO benchmark harness
 
 Install the extra dependency before running the GSM8K benchmark:
 

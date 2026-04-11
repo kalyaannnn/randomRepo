@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
@@ -28,6 +29,7 @@ class SharedWeightLayout:
         device: torch.device | str | None = None,
         trust_remote_code: bool = False,
         sdpa_backend: str = "auto",
+        adapter_path: str | None = None,
     ) -> None:
         """Load the shared base model and attach LoRA adapters.
 
@@ -38,6 +40,7 @@ class SharedWeightLayout:
             device: Device to move the model onto once.
             trust_remote_code: Whether to allow custom HF model code.
             sdpa_backend: Attention backend policy.
+            adapter_path: Optional path to a saved LoRA adapter to load.
         """
 
         self.model_name = model_name
@@ -61,7 +64,23 @@ class SharedWeightLayout:
             trust_remote_code=trust_remote_code,
             low_cpu_mem_usage=True,
         )
-        self.model = get_peft_model(base_model, lora_config)
+        if adapter_path is not None:
+            try:
+                from peft import PeftModel
+            except ImportError as exc:
+                raise ImportError(
+                    "Loading a saved LoRA adapter requires `peft.PeftModel` to be available."
+                ) from exc
+            adapter_dir = Path(adapter_path).expanduser()
+            if not adapter_dir.exists():
+                raise FileNotFoundError(f"LoRA adapter path does not exist: {adapter_dir}")
+            self.model = PeftModel.from_pretrained(
+                base_model,
+                adapter_dir,
+                is_trainable=True,
+            )
+        else:
+            self.model = get_peft_model(base_model, lora_config)
         self._prepare_parameter_states()
         self.model.to(self.device)
 
@@ -125,6 +144,14 @@ class SharedWeightLayout:
             "adapter_mb": adapter_bytes / (1024 * 1024),
             "total_mb": total_bytes / (1024 * 1024),
         }
+
+    def save_adapter(self, path: str | Path) -> Path:
+        """Persist just the LoRA adapter weights and config."""
+
+        output_path = Path(path).expanduser()
+        output_path.mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(output_path)
+        return output_path
 
     def _prepare_parameter_states(self) -> None:
         """Ensure base weights are frozen and only LoRA parameters remain trainable."""
