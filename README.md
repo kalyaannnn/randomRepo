@@ -41,8 +41,9 @@ python -m examples.train_math --model Qwen/Qwen2.5-1.5B-Instruct --steps 5 --spl
 
 The next validation phase uses a real filtered GSM8K subset loaded through the
 HuggingFace `datasets` package. AgentRL keeps only shorter GSM8K questions with
-integer final answers so the first benchmark run stays manageable on a single
-GPU while using authentic dataset examples.
+integer final answers, and the default `easy` curriculum ranks examples toward
+the simplest real problems first so the first benchmark run stays manageable on
+a single GPU while still using authentic dataset examples.
 
 Example:
 
@@ -55,6 +56,7 @@ python -m examples.benchmark_gsm8k_subset \
   --max-new-tokens 64 \
   --subset-size 128 \
   --max-question-words 45 \
+  --curriculum easy \
   --split train \
   --output-dir ./checkpoints_gsm8k_subset
 ```
@@ -70,6 +72,11 @@ Install the extra dependency before running the GSM8K benchmark:
 ```bash
 pip install datasets
 ```
+
+If the standard GSM8K slice collapses to all-zero rewards at initialization,
+start with `--curriculum easy` first. It still uses real GSM8K examples, but it
+prefers shorter and simpler questions before expanding to the broader filtered
+subset.
 
 ## Canonical Smoke Config
 

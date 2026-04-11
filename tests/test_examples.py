@@ -131,6 +131,7 @@ def test_gsm8k_subset_environment_and_verifier_roundtrip() -> None:
     assert "Final answer: <integer>" in prompt
     assert done is True
     assert reward == 1.0
+    assert env.state()["curriculum"] == "easy"
 
 
 def test_gsm8k_subset_verifier_requires_exact_one_line_format() -> None:
@@ -171,14 +172,52 @@ def test_gsm8k_subset_extracts_answer_and_filters_examples(monkeypatch) -> None:
     assert state["answer"] in {7, 11}
 
 
+def test_gsm8k_subset_easy_curriculum_prefers_simpler_examples(monkeypatch) -> None:
+    rows = [
+        {
+            "question": (
+                "A club raises 18 dollars, then 24 dollars, and later spends 7 dollars on snacks. "
+                "After buying 3 pens for 2 dollars each, how much money remains?"
+            ),
+            "answer": "18 + 24 - 7 - 6 = 29\n#### 29",
+        },
+        {
+            "question": "A cart has 2 apples and gets 3 more. How many apples are there in total?",
+            "answer": "2 + 3 = 5\n#### 5",
+        },
+    ]
+
+    def fake_load_dataset_split(self):
+        return rows
+
+    monkeypatch.setattr(GSM8KSubsetEnvironment, "_load_dataset_split", fake_load_dataset_split)
+
+    easy_env = GSM8KSubsetEnvironment(
+        split="train",
+        subset_size=1,
+        max_question_words=60,
+        curriculum="easy",
+    )
+    standard_env = GSM8KSubsetEnvironment(
+        split="train",
+        subset_size=1,
+        max_question_words=60,
+        curriculum="standard",
+    )
+
+    assert easy_env._problems[0].answer == 5
+    assert standard_env._problems[0].answer == 29
+
+
 def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
     captured = {}
 
     class StubEnvironment:
-        def __init__(self, split, subset_size, max_question_words):
+        def __init__(self, split, subset_size, max_question_words, curriculum):
             self.split = split
             self.subset_size = subset_size
             self.max_question_words = max_question_words
+            self.curriculum = curriculum
 
     class StubVerifier:
         pass
@@ -218,6 +257,8 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
             "16",
             "--max-question-words",
             "50",
+            "--curriculum",
+            "standard",
             "--replay-every",
             "1",
         ],
@@ -235,5 +276,6 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
     assert captured["environment"].split == "test"
     assert captured["environment"].subset_size == 16
     assert captured["environment"].max_question_words == 50
+    assert captured["environment"].curriculum == "standard"
     assert captured["verifier"].__class__.__name__ == "StubVerifier"
     assert captured["trained"] is True

@@ -12,6 +12,21 @@ from agentrl import BaseEnvironment, BaseVerifier
 
 _STRICT_FINAL_ANSWER_RE = re.compile(r"^\s*Final answer:\s*(-?\d+)\s*$", re.IGNORECASE)
 _GSM8K_ANSWER_RE = re.compile(r"####\s*(-?\d[\d,]*)")
+_INTEGER_RE = re.compile(r"-?\d+")
+_EASY_KEYWORDS = (
+    "total",
+    "left",
+    "remain",
+    "together",
+    "altogether",
+    "each",
+    "equally",
+    "more",
+    "less",
+    "gave",
+    "bought",
+    "spent",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +53,7 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
         split: str = "train",
         subset_size: int = 128,
         max_question_words: int = 45,
+        curriculum: str = "easy",
         dataset_name: str = "gsm8k",
         dataset_config_name: str = "main",
         seed: int = 0,
@@ -49,10 +65,13 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
             raise ValueError("max_question_words must be > 0.")
         if split not in {"train", "test"}:
             raise ValueError(f"Unsupported split '{split}'. Expected 'train' or 'test'.")
+        if curriculum not in {"easy", "standard"}:
+            raise ValueError("curriculum must be either 'easy' or 'standard'.")
 
         self.split = split
         self.subset_size = subset_size
         self.max_question_words = max_question_words
+        self.curriculum = curriculum
         self.dataset_name = dataset_name
         self.dataset_config_name = dataset_config_name
         self._rng = random.Random(seed)
@@ -86,6 +105,7 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
             "answer": self._current_problem.answer,
             "solution": self._current_problem.solution,
             "split": self.split,
+            "curriculum": self.curriculum,
             "dataset": self.dataset_name,
             "dataset_config_name": self.dataset_config_name,
         }
@@ -110,16 +130,17 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
                     solution=solution,
                 )
             )
-            if len(filtered) >= self.subset_size:
-                break
+
+        if self.curriculum == "easy":
+            filtered.sort(key=self._difficulty_key)
 
         if len(filtered) < self.subset_size:
             raise RuntimeError(
                 "Filtered GSM8K subset is smaller than requested. "
                 f"Requested {self.subset_size}, found {len(filtered)} with "
-                f"max_question_words={self.max_question_words}."
+                f"max_question_words={self.max_question_words} and curriculum='{self.curriculum}'."
             )
-        return filtered
+        return filtered[: self.subset_size]
 
     def _load_dataset_split(self) -> list[dict[str, Any]]:
         try:
@@ -140,6 +161,32 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
         if match is None:
             return None
         return int(match.group(1).replace(",", ""))
+
+    @staticmethod
+    def _difficulty_key(problem: GSM8KProblem) -> tuple[int, int, int, int, int]:
+        """Rank problems so lower tuples represent easier GSM8K examples.
+
+        The heuristic prefers:
+        - shorter questions
+        - shorter reference solutions
+        - fewer integers mentioned in the question
+        - smaller absolute final answers
+        - questions with common single-step arithmetic keywords
+        """
+
+        question_lower = problem.question.lower()
+        keyword_bonus = 0 if any(token in question_lower for token in _EASY_KEYWORDS) else 1
+        question_words = len(problem.question.split())
+        solution_words = len(problem.solution.split())
+        integer_count = len(_INTEGER_RE.findall(problem.question))
+        abs_answer = abs(problem.answer)
+        return (
+            keyword_bonus,
+            integer_count,
+            question_words,
+            solution_words,
+            abs_answer,
+        )
 
 
 class GSM8KSubsetVerifier(BaseVerifier):

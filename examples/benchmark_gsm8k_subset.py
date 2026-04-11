@@ -43,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep only GSM8K questions up to this word count.",
     )
     parser.add_argument(
+        "--curriculum",
+        default="easy",
+        choices=["easy", "standard"],
+        help="Use an easy-ranked GSM8K subset or the first standard filtered slice.",
+    )
+    parser.add_argument(
         "--replay-every",
         type=int,
         default=1,
@@ -70,6 +76,7 @@ def main() -> None:
             split=args.split,
             subset_size=args.subset_size,
             max_question_words=args.max_question_words,
+            curriculum=args.curriculum,
         ),
         verifier=GSM8KSubsetVerifier(),
     )
