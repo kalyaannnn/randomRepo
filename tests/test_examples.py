@@ -76,6 +76,7 @@ def test_train_math_uses_public_api_shape(monkeypatch) -> None:
     assert captured["config"].group_size == 4
     assert captured["config"].max_new_tokens == 32
     assert captured["config"].output_dir == "./artifacts"
+    assert captured["config"].use_continuous_batching is False
     assert captured["environment"].split == "eval"
     assert captured["verifier"].__class__.__name__ == "MathVerifier"
     assert captured["trained"] is True
@@ -340,6 +341,7 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
     assert captured["config"].init_adapter_path == "./adapter"
     assert captured["config"].temperature == 0.8
     assert captured["config"].top_p == 0.95
+    assert captured["config"].use_continuous_batching is False
     assert captured["config"].stop_strings == ("\nHuman:",)
     assert captured["environment"].split == "test"
     assert captured["environment"].subset_size == 16

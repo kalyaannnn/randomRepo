@@ -38,6 +38,7 @@ def main() -> None:
         group_size=args.group_size,
         max_new_tokens=args.max_new_tokens,
         output_dir=args.output_dir,
+        use_continuous_batching=False,
     )
     trainer = GRPOTrainer(
         config=config,

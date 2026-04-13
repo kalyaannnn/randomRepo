@@ -92,6 +92,7 @@ def main() -> None:
         replay_every=args.replay_every,
         init_adapter_path=args.init_adapter_path,
         stop_strings=environment.STOP_STRINGS,
+        use_continuous_batching=False,
     )
     trainer = GRPOTrainer(
         config=config,
