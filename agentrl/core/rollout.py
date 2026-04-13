@@ -165,6 +165,10 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
     def _render_generation_prompt(self, observations: list[str], actions: list[str]) -> str:
         """Render the canonical plain-text transcript for the next generation step."""
 
+        custom_renderer = getattr(self.environment, "render_generation_prompt", None)
+        if callable(custom_renderer):
+            return custom_renderer(self.tokenizer, observations, actions)
+
         parts: list[str] = []
         for index, observation in enumerate(observations):
             parts.append("Observation:\n")
@@ -183,6 +187,10 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         actions: list[str],
     ) -> tuple[str, list[tuple[int, int]]]:
         """Render a full transcript and record character spans of assistant text."""
+
+        custom_renderer = getattr(self.environment, "render_transcript", None)
+        if callable(custom_renderer):
+            return custom_renderer(self.tokenizer, observations, actions)
 
         parts: list[str] = []
         assistant_spans: list[tuple[int, int]] = []
@@ -231,7 +239,8 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
                     input_ids,
                     attention_mask,
                 )
-            return self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
+            response_text = self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
+            return self._postprocess_response(response_text)
 
         generate_kwargs = {
             "input_ids": input_ids,
@@ -242,12 +251,15 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": getattr(self.tokenizer, "eos_token_id", None),
         }
+        if self.config.do_sample and self.config.top_p < 1.0:
+            generate_kwargs["top_p"] = self.config.top_p
         with torch.no_grad():
             generated = generation_model.generate(**generate_kwargs)
 
         prompt_length = input_ids.shape[-1]
         response_ids = generated[:, prompt_length:]
-        return self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
+        response_text = self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
+        return self._postprocess_response(response_text)
 
     def _generate_with_chunked_prefill(
         self,
@@ -287,9 +299,39 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         """Sample or greedily decode the next token from final-step logits."""
 
         if self.config.do_sample and self.config.temperature > 0:
-            probs = torch.softmax(next_token_logits / self.config.temperature, dim=-1)
+            filtered_logits = self._apply_top_p(next_token_logits / self.config.temperature)
+            probs = torch.softmax(filtered_logits, dim=-1)
             return torch.multinomial(probs, num_samples=1, generator=self.rng).squeeze(-1)
         return torch.argmax(next_token_logits, dim=-1)
+
+    def _apply_top_p(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply nucleus filtering to logits when configured."""
+
+        if self.config.top_p >= 1.0:
+            return logits
+
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_mask = cumulative_probs > self.config.top_p
+        sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+        sorted_mask[..., 0] = False
+        filtered_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+        return torch.empty_like(filtered_logits).scatter(-1, sorted_indices, filtered_logits)
+
+    def _postprocess_response(self, response_text: str) -> str:
+        """Apply optional environment- or config-driven stop-string cleanup."""
+
+        custom_postprocess = getattr(self.environment, "postprocess_response", None)
+        if callable(custom_postprocess):
+            return custom_postprocess(response_text)
+
+        truncated = response_text
+        for stop_string in self.config.stop_strings:
+            stop_index = truncated.find(stop_string)
+            if stop_index != -1:
+                truncated = truncated[:stop_index]
+        return truncated.rstrip()
 
     def _pack_sequences(
         self,

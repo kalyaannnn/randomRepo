@@ -48,8 +48,10 @@ class GRPOConfig:
     max_prompt_tokens: int | None = None
     max_episode_steps: int = 8
     temperature: float = 1.0
+    top_p: float = 1.0
     debug_temperature: float = 0.0
     do_sample: bool = True
+    stop_strings: tuple[str, ...] = ()
     clip_range: float = 10.0
     gradient_accumulation_steps: int = 1
     seed: int = 42
@@ -107,6 +109,8 @@ class GRPOConfig:
             raise ConfigurationError("clip_range must be > 0.")
         if self.temperature < 0:
             raise ConfigurationError("temperature must be >= 0.")
+        if not (0.0 < self.top_p <= 1.0):
+            raise ConfigurationError("top_p must satisfy 0.0 < top_p <= 1.0.")
         if self.debug_temperature != 0.0:
             raise ConfigurationError("debug_temperature must be 0.0 for deterministic replay.")
         if self.max_prompt_tokens is not None and self.max_prompt_tokens <= 0:
@@ -160,6 +164,7 @@ class GRPOConfig:
 
         return {
             "temperature": self.temperature,
+            "top_p": self.top_p,
             "do_sample": self.do_sample,
         }
 
@@ -168,6 +173,7 @@ class GRPOConfig:
 
         return {
             "temperature": self.debug_temperature,
+            "top_p": 1.0,
             "do_sample": False,
         }
 

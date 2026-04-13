@@ -10,7 +10,7 @@ from typing import Any
 from agentrl import BaseEnvironment, BaseVerifier
 
 
-_STRICT_FINAL_ANSWER_RE = re.compile(r"^\s*Final answer:\s*(-?\d+)\s*$", re.IGNORECASE)
+_FINAL_LINE_RE = re.compile(r"^Final answer:\s*(-?\d+)\s*$", re.IGNORECASE)
 _GSM8K_ANSWER_RE = re.compile(r"####\s*(-?\d[\d,]*)")
 _INTEGER_RE = re.compile(r"-?\d+")
 _EASY_KEYWORDS = (
@@ -48,6 +48,19 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
     jumping straight to the entire dataset.
     """
 
+    SYSTEM_PROMPT = (
+        "You are solving grade-school math word problems.\n"
+        "You may reason step by step.\n"
+        "The last non-empty line of your response must be exactly:\n"
+        "Final answer: <integer>"
+    )
+    STOP_STRINGS = (
+        "\nObservation:",
+        "\nUser:",
+        "\nHuman:",
+        "\nProblem:",
+    )
+
     def __init__(
         self,
         split: str = "train",
@@ -79,10 +92,10 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
         self._current_problem: GSM8KProblem | None = None
 
     def reset(self) -> str:
-        """Return the next GSM8K prompt formatted for strict answer checking."""
+        """Return the next GSM8K question."""
 
         self._current_problem = self._rng.choice(self._problems)
-        return self._render_prompt(self._current_problem.question)
+        return self._current_problem.question
 
     def step(self, action: str) -> tuple[str, bool]:
         """Mark the single-turn episode as complete."""
@@ -105,13 +118,13 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
             "dataset_config_name": self.dataset_config_name,
         }
 
-    def supervised_samples(self) -> list[tuple[str, str]]:
-        """Return SFT prompt/target pairs aligned with the runtime prompt format."""
+    def supervised_samples(self, tokenizer: Any | None = None) -> list[tuple[str, str]]:
+        """Return rationale-based SFT prompt/target pairs aligned with runtime prompting."""
 
         return [
             (
-                self._render_prompt(problem.question),
-                f"Final answer: {problem.answer}",
+                self.render_prompt(tokenizer, problem.question),
+                self._build_supervised_target(problem.solution, problem.answer),
             )
             for problem in self._problems
         ]
@@ -153,14 +166,54 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
             )
         return filtered[: self.subset_size]
 
-    @staticmethod
-    def _render_prompt(question: str) -> str:
-        return (
-            "Solve the following GSM8K math word problem.\n"
-            "Reply with exactly one line and nothing else:\n"
-            "Final answer: <integer>\n\n"
-            f"Problem: {question}"
-        )
+    def render_prompt(self, tokenizer: Any | None, question: str) -> str:
+        """Render the GSM8K question through the model's chat template."""
+
+        return self.render_generation_prompt(tokenizer, [question], [])
+
+    def render_generation_prompt(
+        self,
+        tokenizer: Any | None,
+        observations: list[str],
+        actions: list[str],
+    ) -> str:
+        """Render the current conversation with a generation prompt."""
+
+        messages = self._build_messages(observations, actions)
+        return self._apply_chat_template(tokenizer, messages, add_generation_prompt=True)
+
+    def render_transcript(
+        self,
+        tokenizer: Any | None,
+        observations: list[str],
+        actions: list[str],
+    ) -> tuple[str, list[tuple[int, int]]]:
+        """Render a full chat transcript and locate assistant spans."""
+
+        messages = self._build_messages(observations, actions)
+        transcript_text = self._apply_chat_template(tokenizer, messages, add_generation_prompt=False)
+        assistant_spans: list[tuple[int, int]] = []
+        search_start = 0
+        for action in actions:
+            start = transcript_text.find(action, search_start)
+            if start == -1:
+                start = transcript_text.rfind(action)
+            if start == -1:
+                raise RuntimeError("Could not align assistant content inside GSM8K transcript.")
+            end = start + len(action)
+            assistant_spans.append((start, end))
+            search_start = end
+        return transcript_text, assistant_spans
+
+    def postprocess_response(self, response: str) -> str:
+        """Trim known prompt-like continuation strings after generation."""
+
+        truncated = response
+        for stop_string in self.STOP_STRINGS:
+            stop_index = truncated.find(stop_string)
+            if stop_index != -1:
+                truncated = truncated[:stop_index]
+        return truncated.rstrip()
 
     def _load_dataset_split(self) -> list[dict[str, Any]]:
         try:
@@ -181,6 +234,50 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
         if match is None:
             return None
         return int(match.group(1).replace(",", ""))
+
+    @classmethod
+    def _build_supervised_target(cls, solution: str, answer: int) -> str:
+        """Convert GSM8K worked solutions into rationale-plus-final-answer targets."""
+
+        rationale = re.sub(r"\s*####\s*-?\d[\d,]*\s*$", "", solution).strip()
+        if rationale:
+            return f"{rationale}\n\nFinal answer: {answer}"
+        return f"Final answer: {answer}"
+
+    @classmethod
+    def _build_messages(
+        cls,
+        observations: list[str],
+        actions: list[str],
+    ) -> list[dict[str, str]]:
+        messages = [{"role": "system", "content": cls.SYSTEM_PROMPT}]
+        for index, observation in enumerate(observations):
+            messages.append({"role": "user", "content": observation})
+            if index < len(actions):
+                messages.append({"role": "assistant", "content": actions[index]})
+        return messages
+
+    @classmethod
+    def _apply_chat_template(
+        cls,
+        tokenizer: Any | None,
+        messages: list[dict[str, str]],
+        add_generation_prompt: bool,
+    ) -> str:
+        if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+
+        parts = [f"System:\n{cls.SYSTEM_PROMPT}\n\n"]
+        for message in messages[1:]:
+            role = message["role"].capitalize()
+            parts.append(f"{role}:\n{message['content']}\n\n")
+        if add_generation_prompt:
+            parts.append("Assistant:\n")
+        return "".join(parts)
 
     @staticmethod
     def _difficulty_key(problem: GSM8KProblem) -> tuple[int, int, int, int, int]:
@@ -212,49 +309,45 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
 class GSM8KSubsetVerifier(BaseVerifier):
     """Verifier for GSM8K subset runs.
 
-    `strict` mirrors benchmark evaluation and only accepts an exact
-    `Final answer: <integer>` line.
-
-    `shaped` is intended for training from a cold start on real GSM8K. It keeps
-    the same target answer, but rewards progressively for partial progress so
-    the policy can escape all-zero batches.
+    Only an exact terminal `Final answer: <integer>` line is accepted.
     """
 
-    def __init__(self, reward_mode: str = "shaped") -> None:
-        if reward_mode not in {"strict", "shaped"}:
-            raise ValueError("reward_mode must be either 'strict' or 'shaped'.")
-        self.reward_mode = reward_mode
+    def __init__(self, reward_mode: str = "strict") -> None:
+        if reward_mode not in {"strict", "binary", "shaped"}:
+            raise ValueError("reward_mode must be one of: strict, binary, shaped.")
+        self.reward_mode = "strict"
 
     def verify(self, response: str, env_state: dict[str, int | str]) -> float:
-        """Return a deterministic reward for the predicted final integer."""
+        """Return a strict binary reward based on the terminal final-answer line."""
 
         answer = int(env_state["answer"])
-        strict_match = _STRICT_FINAL_ANSWER_RE.fullmatch(response)
-        if strict_match is not None:
-            predicted = int(strict_match.group(1))
-            if predicted == answer:
-                return 1.0
-            if self.reward_mode == "strict":
-                return 0.0
-            tolerance = max(1, abs(answer) // 10)
-            return 0.2 if abs(predicted - answer) <= tolerance else 0.15
-
-        if self.reward_mode == "strict":
+        predicted = self.extract_terminal_final_answer(response)
+        if predicted is None:
             return 0.0
+        return 1.0 if predicted == answer else 0.0
 
-        formatted = re.search(r"Final answer:\s*(-?\d+)", response, re.IGNORECASE)
-        if formatted is not None:
-            return 0.75 if int(formatted.group(1)) == answer else 0.15
+    @staticmethod
+    def extract_terminal_final_answer(response: str) -> int | None:
+        """Parse only the last non-empty line as a final answer."""
 
-        integers = _INTEGER_RE.findall(response)
-        if not integers:
-            return 0.0
-
-        candidate = int(integers[-1])
-        if candidate == answer:
-            return 0.5
-
-        tolerance = max(1, abs(answer) // 10)
-        if abs(candidate - answer) <= tolerance:
-            return 0.2
-        return 0.0
+        if not response:
+            return None
+        lines = [line.strip() for line in response.strip().splitlines() if line.strip()]
+        if not lines:
+            return None
+        match = _FINAL_LINE_RE.fullmatch(lines[-1])
+        if match is None:
+            return None
+        return int(match.group(1))
+    SYSTEM_PROMPT = (
+        "You are solving grade-school math word problems.\n"
+        "You may reason step by step.\n"
+        "The last non-empty line of your response must be exactly:\n"
+        "Final answer: <integer>"
+    )
+    STOP_STRINGS = (
+        "\nObservation:",
+        "\nUser:",
+        "\nHuman:",
+        "\nProblem:",
+    )

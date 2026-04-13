@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-seq-length",
         type=int,
-        default=256,
+        default=512,
         help="Maximum prompt-plus-target token length retained during SFT.",
     )
     parser.add_argument(
@@ -114,7 +114,7 @@ def main() -> None:
         sdpa_backend=config.sdpa_backend,
     )
     trainer = SFTBootstrapTrainer(config=config, tokenizer=tokenizer, layout=layout)
-    history = trainer.train(environment.supervised_samples(), epochs=args.epochs)
+    history = trainer.train(environment.supervised_samples(tokenizer=tokenizer), epochs=args.epochs)
     output_dir = trainer.save_adapter(args.adapter_dir)
     final_loss = history[-1]["loss"] if history else float("nan")
     print(f"Saved adapter to {output_dir}")

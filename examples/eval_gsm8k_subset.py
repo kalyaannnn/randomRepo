@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=32,
+        default=128,
         help="Maximum generation budget per evaluation example.",
     )
     return parser
@@ -127,7 +127,7 @@ def main() -> None:
     total_response_tokens = 0
     with predictions_path.open("w", encoding="utf-8") as handle:
         for problem in environment.problems():
-            prompt = environment._render_prompt(problem.question)
+            prompt = environment.render_prompt(tokenizer, problem.question)
             encoded = tokenizer(
                 prompt,
                 return_tensors="pt",
@@ -149,7 +149,7 @@ def main() -> None:
                     eos_token_id=getattr(tokenizer, "eos_token_id", None),
                 )
             response_ids = generated[:, input_ids.shape[-1] :]
-            response = tokenizer.decode(response_ids[0], skip_special_tokens=True)
+            response = environment.postprocess_response(tokenizer.decode(response_ids[0], skip_special_tokens=True))
             reward = verifier.verify(
                 response,
                 {

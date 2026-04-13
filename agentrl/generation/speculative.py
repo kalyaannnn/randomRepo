@@ -124,7 +124,7 @@ class SpeculativeRolloutOrchestrator(RolloutOrchestrator):
         for _ in range(self.config.max_episode_steps):
             prompt_text = self._render_generation_prompt(observations, actions)
             generated_ids, generated_logprobs = self._generate_speculative_tokens(prompt_text)
-            response_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            response_text = self._postprocess_response(self.tokenizer.decode(generated_ids, skip_special_tokens=True))
             actions.append(response_text)
             turn_token_ids.append(generated_ids.clone())
             turn_policy_logprobs.append(generated_logprobs.clone())

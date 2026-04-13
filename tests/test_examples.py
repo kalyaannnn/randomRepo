@@ -131,8 +131,7 @@ def test_gsm8k_subset_environment_and_verifier_roundtrip() -> None:
     _, done = env.step("Final answer: 13")
     reward = verifier.verify("Final answer: 13", env.state())
 
-    assert "GSM8K math word problem" in prompt
-    assert "Final answer: <integer>" in prompt
+    assert "candies" in prompt
     assert done is True
     assert reward == 1.0
     assert env.state()["curriculum"] == "easy"
@@ -145,17 +144,18 @@ def test_gsm8k_subset_verifier_requires_exact_one_line_format() -> None:
     assert verifier.verify("Final answer: 18", state) == 1.0
     assert verifier.verify("18", state) == 0.0
     assert verifier.verify("Final answer: 18\nextra", state) == 0.0
+    assert verifier.verify("Final answer: 17", state) == 0.0
+    assert verifier.verify("The answer is 18.", state) == 0.0
 
 
-def test_gsm8k_subset_shaped_verifier_rewards_partial_progress() -> None:
-    verifier = GSM8KSubsetVerifier(reward_mode="shaped")
+def test_gsm8k_subset_binary_alias_matches_strict_behavior() -> None:
+    verifier = GSM8KSubsetVerifier(reward_mode="binary")
     state = {"answer": 18, "split": "train", "dataset": "gsm8k"}
 
     assert verifier.verify("Final answer: 18", state) == 1.0
-    assert verifier.verify("Final answer: 18\nextra", state) == 0.75
-    assert verifier.verify("The answer is 18.", state) == 0.5
-    assert verifier.verify("Final answer: 17", state) == 0.2
-    assert verifier.verify("The answer is 17.", state) == 0.2
+    assert verifier.verify("Final answer: 18\nextra", state) == 0.0
+    assert verifier.verify("The answer is 18.", state) == 0.0
+    assert verifier.verify("Final answer: 17", state) == 0.0
     assert verifier.verify("I have no idea.", state) == 0.0
 
 
@@ -184,11 +184,21 @@ def test_gsm8k_subset_extracts_answer_and_filters_examples(monkeypatch) -> None:
     state = env.state()
 
     assert len(env._problems) == 2
-    assert "Problem:" in prompt
+    assert "Short question" in prompt
     assert state["answer"] in {7, 11}
 
 
-def test_gsm8k_subset_builds_supervised_samples() -> None:
+def test_gsm8k_subset_builds_rationale_supervised_samples() -> None:
+    class TemplateTokenizer:
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+            assert tokenize is False
+            rendered = []
+            for message in messages:
+                rendered.append(f"{message['role']}::{message['content']}")
+            if add_generation_prompt:
+                rendered.append("assistant::")
+            return "\n".join(rendered)
+
     env = GSM8KSubsetEnvironment(
         split="train",
         problems=[
@@ -200,12 +210,24 @@ def test_gsm8k_subset_builds_supervised_samples() -> None:
         ],
     )
 
-    samples = env.supervised_samples()
+    samples = env.supervised_samples(tokenizer=TemplateTokenizer())
 
     assert len(samples) == 1
     prompt, target = samples[0]
-    assert "Reply with exactly one line and nothing else" in prompt
-    assert target == "Final answer: 13"
+    assert "system::You are solving grade-school math word problems." in prompt
+    assert "user::A jar has 10 candies and 3 more are added. How many candies are in the jar?" in prompt
+    assert target == "10 + 3 = 13\n\nFinal answer: 13"
+
+
+def test_gsm8k_subset_postprocesses_junk_continuations() -> None:
+    env = GSM8KSubsetEnvironment(
+        split="train",
+        problems=[GSM8KProblem("What is 2 + 2?", 4, "2 + 2 = 4\n#### 4")],
+    )
+
+    cleaned = env.postprocess_response("Final answer: 4\nHuman: keep going")
+
+    assert cleaned == "Final answer: 4"
 
 
 def test_gsm8k_subset_easy_curriculum_prefers_simpler_examples(monkeypatch) -> None:
@@ -254,6 +276,7 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
             self.subset_size = subset_size
             self.max_question_words = max_question_words
             self.curriculum = curriculum
+            self.STOP_STRINGS = ("\nHuman:",)
 
     class StubVerifier:
         def __init__(self, reward_mode):
@@ -315,6 +338,9 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
     assert captured["config"].output_dir == "./bench"
     assert captured["config"].replay_every == 1
     assert captured["config"].init_adapter_path == "./adapter"
+    assert captured["config"].temperature == 0.8
+    assert captured["config"].top_p == 0.95
+    assert captured["config"].stop_strings == ("\nHuman:",)
     assert captured["environment"].split == "test"
     assert captured["environment"].subset_size == 16
     assert captured["environment"].max_question_words == 50
@@ -333,7 +359,8 @@ def test_bootstrap_gsm8k_subset_uses_public_api_shape(monkeypatch, tmp_path) -> 
             self.max_question_words = max_question_words
             self.curriculum = curriculum
 
-        def supervised_samples(self):
+        def supervised_samples(self, tokenizer=None):
+            captured["bootstrap_tokenizer"] = tokenizer
             return [("Problem: 2 + 2", "Final answer: 4")]
 
     class StubLayout:
@@ -419,6 +446,7 @@ def test_bootstrap_gsm8k_subset_uses_public_api_shape(monkeypatch, tmp_path) -> 
     assert captured["samples"] == [("Problem: 2 + 2", "Final answer: 4")]
     assert captured["epochs"] == 2
     assert captured["adapter_dir"] == str(tmp_path / "adapter")
+    assert captured["bootstrap_tokenizer"] is captured["tokenizer"]
 
 
 def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:
@@ -436,8 +464,13 @@ def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:
             return [GSM8KProblem("What is 2 + 2?", 4, "2 + 2 = 4\n#### 4")]
 
         @staticmethod
-        def _render_prompt(question):
+        def render_prompt(tokenizer, question):
+            del tokenizer
             return f"Prompt: {question}"
+
+        @staticmethod
+        def postprocess_response(response):
+            return response.split("\nHuman:", 1)[0]
 
     class StubVerifier:
         def __init__(self, reward_mode):
@@ -463,7 +496,7 @@ def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:
 
         def decode(self, response_ids, skip_special_tokens):
             del response_ids, skip_special_tokens
-            return "Final answer: 4"
+            return "Final answer: 4\nHuman: keep going"
 
     class StubModel:
         config = SimpleNamespace(use_cache=False)

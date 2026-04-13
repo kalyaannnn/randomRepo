@@ -55,6 +55,8 @@ def test_config_defaults_match_prompt_surface() -> None:
     assert config.use_speculative_decoding is False
     assert config.max_episode_steps == 8
     assert config.output_path.name == "checkpoints"
+    assert config.top_p == 1.0
+    assert config.stop_strings == ()
 
 
 def test_config_requires_draft_model_for_speculative_decoding() -> None:
@@ -97,5 +99,5 @@ def test_config_rejects_use_lora_false_until_supported() -> None:
 def test_config_replay_generation_is_deterministic() -> None:
     config = GRPOConfig(model_name="Qwen/Qwen2.5-1.5B-Instruct")
 
-    assert config.rollout_generation_kwargs() == {"temperature": 1.0, "do_sample": True}
-    assert config.replay_generation_kwargs() == {"temperature": 0.0, "do_sample": False}
+    assert config.rollout_generation_kwargs() == {"temperature": 1.0, "top_p": 1.0, "do_sample": True}
+    assert config.replay_generation_kwargs() == {"temperature": 0.0, "top_p": 1.0, "do_sample": False}

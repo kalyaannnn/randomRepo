@@ -251,7 +251,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                     sequence_lengths[episode_index] += 1
                     next_logits_by_index[episode_index] = bucket_logits[offset : offset + 1]
 
-        decoded = [self.tokenizer.decode(tokens, skip_special_tokens=True) for tokens in generated_ids]
+        decoded = [self._postprocess_response(self.tokenizer.decode(tokens, skip_special_tokens=True)) for tokens in generated_ids]
         padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
         return decoded, padding_ratio
 
@@ -297,7 +297,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 if token == getattr(self.tokenizer, "eos_token_id", None):
                     finished[episode_index] = True
 
-        decoded = [self.tokenizer.decode(tokens, skip_special_tokens=True) for tokens in generated_ids]
+        decoded = [self._postprocess_response(self.tokenizer.decode(tokens, skip_special_tokens=True)) for tokens in generated_ids]
         padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
         return decoded, padding_ratio
 
@@ -398,11 +398,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             logits = generation_model(input_ids=padded, attention_mask=attention_mask).logits
             next_token_logits = logits[:, -1, :]
 
-            if self.config.do_sample and self.config.temperature > 0:
-                probs = torch.softmax(next_token_logits / self.config.temperature, dim=-1)
-                sampled = torch.multinomial(probs, num_samples=1, generator=self.rng).squeeze(-1)
-            else:
-                sampled = torch.argmax(next_token_logits, dim=-1)
+            sampled = self._sample_next_token(next_token_logits)
             chunk_outputs.append(sampled)
         return torch.cat(chunk_outputs, dim=0)
 
