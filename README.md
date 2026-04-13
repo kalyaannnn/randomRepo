@@ -48,17 +48,69 @@ default `shaped` reward mode gives partial credit for correct formatting or
 numerically close answers so the run does not start from all-zero batches. For
 exact-match evaluation, switch back to `--reward-mode strict`.
 
+The current GSM8K path is:
+
+1. bootstrap a LoRA adapter with supervised targets of the form `Final answer: <integer>`
+2. continue training with GRPO against the real verifier in `reward_mode="shaped"`
+3. evaluate separately with `reward_mode="strict"`
+
+The exact prompt format emitted by `GSM8KSubsetEnvironment` is:
+
+```text
+Solve the following GSM8K math word problem.
+Reply with exactly one line and nothing else:
+Final answer: <integer>
+
+Problem: {question}
+```
+
+During rollout, AgentRL wraps that inside its canonical transcript prompt:
+
+```text
+Observation:
+Solve the following GSM8K math word problem.
+Reply with exactly one line and nothing else:
+Final answer: <integer>
+
+Problem: {question}
+
+Assistant:
+```
+
+The shaped verifier currently uses these exact rewards:
+
+- `1.0`: exact one-line `Final answer: <integer>` and correct integer
+- `0.75`: formatted `Final answer: <integer>` appears somewhere and the integer is correct, but extra text exists
+- `0.5`: no formatted answer, but the last extracted integer matches the gold answer
+- `0.2`: near miss within `max(1, abs(answer) // 10)`
+- `0.15`: formatted answer exists but the integer is wrong
+- `0.0`: no usable parse
+
+Format reward can fire without correctness. A response like `Final answer: 24`
+followed by extra junk still gets `0.15` if the gold answer is not `24`.
+
+Extraction logic is:
+
+- strict exact line: `^\s*Final answer:\s*(-?\d+)\s*$`
+- formatted fallback: `re.search(r"Final answer:\s*(-?\d+)")`
+- last-integer fallback: `re.findall(r"-?\d+")`, then use the final integer
+
+Two representative shaped-reward failure cases from the real GSM8K runs:
+
+- `Final answer: 24\n\nProblem: A train travels 60 miles in 2 hours...` -> `0.15`
+- `Final answer: 16\nYou are an AI helper that provides help...` -> `0.15`
+
 Example:
 
 ```bash
 python -m examples.bootstrap_gsm8k_subset \
   --model Qwen/Qwen2.5-1.5B-Instruct \
-  --epochs 1 \
+  --epochs 3 \
   --batch-size 4 \
   --subset-size 128 \
   --max-question-words 45 \
   --curriculum easy \
-  --adapter-dir ./bootstrap_gsm8k_adapter
+  --adapter-dir ./bootstrap_gsm8k_adapter_v2
 ```
 
 Then launch GRPO from that saved adapter:
@@ -69,15 +121,37 @@ python -m examples.benchmark_gsm8k_subset \
   --steps 10 \
   --batch-size 1 \
   --group-size 4 \
-  --max-new-tokens 64 \
+  --max-new-tokens 32 \
   --subset-size 128 \
   --max-question-words 45 \
   --curriculum easy \
   --reward-mode shaped \
-  --init-adapter-path ./bootstrap_gsm8k_adapter \
+  --init-adapter-path ./bootstrap_gsm8k_adapter_v2 \
   --split train \
-  --output-dir ./checkpoints_gsm8k_subset
+  --output-dir ./checkpoints_gsm8k_subset_v2
 ```
+
+Strict evaluation is a separate step:
+
+```bash
+python -m examples.eval_gsm8k_subset \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --init-adapter-path ./bootstrap_gsm8k_adapter_v2 \
+  --output-dir ./eval_gsm8k_subset_v2 \
+  --split train \
+  --subset-size 128 \
+  --max-question-words 45 \
+  --curriculum easy \
+  --max-new-tokens 16
+```
+
+The rollout settings used in the working real-GSM8K runs were:
+
+- `group_size=4`
+- `batch_size=1`
+- `temperature=0.8`
+- `do_sample=True`
+- no `top_p` filtering; it is not wired into AgentRL yet
 
 Recommended progression:
 
@@ -96,6 +170,18 @@ If the strict GSM8K run collapses to all-zero rewards at initialization, start
 with `--curriculum easy --reward-mode shaped` first. It still uses real GSM8K
 examples, but it gives the model a gradient signal before you move back to
 `--reward-mode strict` for evaluation.
+
+## Real GSM8K Status
+
+The current validated result on real GSM8K is:
+
+- cold-start GRPO with strict exact-match rewards did not work on `Qwen/Qwen2.5-1.5B-Instruct`
+- `bootstrap -> shaped GRPO` on the real filtered GSM8K subset did work
+- with the stronger bootstrap and shorter generation budget, shaped reward runs reached nonzero mean rewards and non-degenerate group updates on a real verifier-backed task
+- strict exact-match GSM8K on `1.5B` is still not validated
+
+This means the infrastructure and training path are working, but strict GSM8K
+at this model size is still a capability problem rather than a framework bug.
 
 ## Canonical Smoke Config
 
@@ -190,13 +276,19 @@ shows that the harder synthetic `train` split is viable on a small model.
 - Environments used with `group_size > 1` must be `deepcopy`-safe after `reset()`.
 - `chunk_size` controls continuous-batching sub-batches when active sequence count grows too large.
 - `pad_to_multiple_of` trades a bit of extra padding for more regular tensor shapes.
+- `prefill_chunk_size` now affects both standard rollout and continuous batching for long prompts.
+- Continuous batching now keeps persistent KV caches for cache-capable models instead of replaying full histories each decode step.
+- Trainer startup now reports parameter VRAM plus device headroom when CUDA is available.
+- GRPO now saves periodic adapter checkpoints and a final adapter alias under `output_dir/`.
 - If you want the next rung after `smoke`, use `MathEnvironment(split="easy")` before jumping to GSM8K-style tasks.
 
 ## Current Constraints
 
 - AgentRL currently requires `use_lora=True`; full-model GRPO is not wired yet.
 - Gradient checkpointing is opt-in. Enable it only when VRAM pressure requires it.
-- `prefill_chunk_size` is implemented at the mixin level, but the live generation paths are still converging on one long-prompt strategy.
+- `top_p` sampling is not exposed yet.
+- Post-GRPO strict evaluation is possible, but the strongest comparison path still needs explicit eval runs against saved GRPO adapters.
+- Continuous batching now has persistent KV decode, but it is not yet a paged-KV / vLLM-style runtime.
 - The framework is single-device only.
 
 ## Security Note
