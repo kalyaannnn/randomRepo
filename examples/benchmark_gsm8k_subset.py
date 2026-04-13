@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--reward-mode",
         default="strict",
         choices=["strict", "binary", "shaped"],
-        help="Reward mode. 'binary' and legacy 'shaped' both map to strict exact-match behavior.",
+        help="Strict binary reward mode. Legacy 'binary' and 'shaped' aliases are accepted and map to strict exact-match behavior.",
     )
     parser.add_argument(
         "--init-adapter-path",

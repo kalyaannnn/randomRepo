@@ -43,16 +43,16 @@ The next validation phase uses a real filtered GSM8K subset loaded through the
 HuggingFace `datasets` package. AgentRL keeps only shorter GSM8K questions with
 integer final answers, and the default `easy` curriculum ranks examples toward
 the simplest real problems first so the first benchmark run stays manageable on
-a single GPU while still using authentic dataset examples. For training, the
-default `shaped` reward mode gives partial credit for correct formatting or
-numerically close answers so the run does not start from all-zero batches. For
-exact-match evaluation, switch back to `--reward-mode strict`.
+a single GPU while still using authentic dataset examples. The GSM8K verifier is
+strict binary only: the last non-empty line must be exactly
+`Final answer: <integer>` and the integer must match the gold answer.
 
 The current GSM8K path is:
 
-1. bootstrap a LoRA adapter with supervised targets of the form `Final answer: <integer>`
-2. continue training with GRPO against the real verifier in `reward_mode="shaped"`
-3. evaluate separately with `reward_mode="strict"`
+1. bootstrap a LoRA adapter with rationale-plus-final-answer supervised targets
+2. run strict pass@k diagnostics on the bootstrap adapter
+3. continue to strict-binary GRPO only if pass@k is nonzero
+4. evaluate the post-RL adapter separately with strict exact-match
 
 The exact prompt format emitted by `GSM8KSubsetEnvironment` is:
 
@@ -77,28 +77,9 @@ Problem: {question}
 Assistant:
 ```
 
-The shaped verifier currently uses these exact rewards:
-
-- `1.0`: exact one-line `Final answer: <integer>` and correct integer
-- `0.75`: formatted `Final answer: <integer>` appears somewhere and the integer is correct, but extra text exists
-- `0.5`: no formatted answer, but the last extracted integer matches the gold answer
-- `0.2`: near miss within `max(1, abs(answer) // 10)`
-- `0.15`: formatted answer exists but the integer is wrong
-- `0.0`: no usable parse
-
-Format reward can fire without correctness. A response like `Final answer: 24`
-followed by extra junk still gets `0.15` if the gold answer is not `24`.
-
-Extraction logic is:
-
-- strict exact line: `^\s*Final answer:\s*(-?\d+)\s*$`
-- formatted fallback: `re.search(r"Final answer:\s*(-?\d+)")`
-- last-integer fallback: `re.findall(r"-?\d+")`, then use the final integer
-
-Two representative shaped-reward failure cases from the real GSM8K runs:
-
-- `Final answer: 24\n\nProblem: A train travels 60 miles in 2 hours...` -> `0.15`
-- `Final answer: 16\nYou are an AI helper that provides help...` -> `0.15`
+The main next model is `Qwen/Qwen2.5-1.5B-Instruct`. The scripts stay fully
+configurable through `--model`, so the same workflow can be reused later with
+`Qwen/Qwen2.5-3B-Instruct` without code changes.
 
 Example:
 
@@ -110,10 +91,26 @@ python -m examples.bootstrap_gsm8k_subset \
   --subset-size 128 \
   --max-question-words 45 \
   --curriculum easy \
-  --adapter-dir ./bootstrap_gsm8k_adapter_v2
+  --adapter-dir ./bootstrap_gsm8k_adapter_15b
 ```
 
-Then launch GRPO from that saved adapter:
+Then run a strict diagnostic pass@k check on the bootstrap adapter:
+
+```bash
+python -m examples.eval_gsm8k_subset \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --init-adapter-path ./bootstrap_gsm8k_adapter_15b \
+  --output-dir ./eval_gsm8k_subset_15b_diag \
+  --split train \
+  --subset-size 128 \
+  --max-question-words 45 \
+  --curriculum easy \
+  --max-new-tokens 96 \
+  --num-samples 8
+```
+
+Only if the diagnostic run shows nonzero pass@k, launch strict-binary GRPO from
+that saved adapter:
 
 ```bash
 python -m examples.benchmark_gsm8k_subset \
@@ -121,14 +118,14 @@ python -m examples.benchmark_gsm8k_subset \
   --steps 10 \
   --batch-size 1 \
   --group-size 4 \
-  --max-new-tokens 32 \
+  --max-new-tokens 96 \
   --subset-size 128 \
   --max-question-words 45 \
   --curriculum easy \
-  --reward-mode shaped \
-  --init-adapter-path ./bootstrap_gsm8k_adapter_v2 \
+  --reward-mode strict \
+  --init-adapter-path ./bootstrap_gsm8k_adapter_15b \
   --split train \
-  --output-dir ./checkpoints_gsm8k_subset_v2
+  --output-dir ./checkpoints_gsm8k_subset_15b
 ```
 
 Strict evaluation is a separate step:
@@ -136,29 +133,42 @@ Strict evaluation is a separate step:
 ```bash
 python -m examples.eval_gsm8k_subset \
   --model Qwen/Qwen2.5-1.5B-Instruct \
-  --init-adapter-path ./bootstrap_gsm8k_adapter_v2 \
-  --output-dir ./eval_gsm8k_subset_v2 \
+  --init-adapter-path ./checkpoints_gsm8k_subset_15b/checkpoint_final \
+  --output-dir ./eval_gsm8k_subset_15b_final \
   --split train \
   --subset-size 128 \
   --max-question-words 45 \
   --curriculum easy \
-  --max-new-tokens 16
+  --max-new-tokens 96
 ```
 
-The rollout settings used in the working real-GSM8K runs were:
+The diagnostic evaluator reports:
+
+- `pass_at_1`
+- `pass_at_k`
+- `fraction_with_any_correct`
+- `mean_reward`
+- `mean_response_tokens`
+- `fraction_hitting_max_new_tokens`
+
+It also writes `predictions.jsonl` with raw sampled responses, parsed terminal
+predictions, per-sample rewards, and per-sample token lengths for inspection.
+
+The rollout settings used in the working GSM8K path are:
 
 - `group_size=4`
 - `batch_size=1`
 - `temperature=0.8`
 - `do_sample=True`
-- no `top_p` filtering; it is not wired into AgentRL yet
+- `top_p=0.95`
+- `max_new_tokens=96` is the recommended starting budget for GSM8K
 
 Recommended progression:
 
 - use `smoke` to verify your runtime and reward pipeline
-- use `easy` and `train` to check that a small model gets non-degenerate rewards
 - use `examples.bootstrap_gsm8k_subset` to warm-start a real GSM8K subset
-- use `examples.benchmark_gsm8k_subset` as the first realistic GRPO benchmark harness
+- use `examples.eval_gsm8k_subset --num-samples 8` to check whether the bootstrap adapter produces any correct strict trajectories
+- use `examples.benchmark_gsm8k_subset --reward-mode strict` only if bootstrap pass@k is nonzero
 
 Install the extra dependency before running the GSM8K benchmark:
 
@@ -166,22 +176,22 @@ Install the extra dependency before running the GSM8K benchmark:
 pip install datasets
 ```
 
-If the strict GSM8K run collapses to all-zero rewards at initialization, start
-with `--curriculum easy --reward-mode shaped` first. It still uses real GSM8K
-examples, but it gives the model a gradient signal before you move back to
-`--reward-mode strict` for evaluation.
+Interpretation:
+
+- if `pass_at_8` is near zero, RL still has no signal and the next step is a stronger model such as `Qwen/Qwen2.5-3B-Instruct` or an easier bridge task
+- if `pass_at_8` is nontrivial but `pass_at_1` is low, RL may still be useful
+- if `fraction_hitting_max_new_tokens` stays high, increase the decoding budget or improve stopping before blaming RL
 
 ## Real GSM8K Status
 
-The current validated result on real GSM8K is:
+The current hypothesis for real GSM8K is:
 
-- cold-start GRPO with strict exact-match rewards did not work on `Qwen/Qwen2.5-1.5B-Instruct`
-- `bootstrap -> shaped GRPO` on the real filtered GSM8K subset did work
-- with the stronger bootstrap and shorter generation budget, shaped reward runs reached nonzero mean rewards and non-degenerate group updates on a real verifier-backed task
-- strict exact-match GSM8K on `1.5B` is still not validated
+- the strict binary verifier is behaving correctly
+- the remaining failure mode is dominated by truncation plus model capability floor
+- `Qwen/Qwen2.5-1.5B-Instruct` is the next model to test before considering `Qwen/Qwen2.5-3B-Instruct`
 
-This means the infrastructure and training path are working, but strict GSM8K
-at this model size is still a capability problem rather than a framework bug.
+This means the next decision point is whether the bootstrap adapter on `1.5B`
+has nontrivial pass@k. If it does not, more strict RL is unlikely to help.
 
 ## Canonical Smoke Config
 
