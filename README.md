@@ -1,312 +1,301 @@
-# AgentRL
 
-AgentRL is a lightweight single-GPU framework for verifier-based GRPO style post-training of language models.
+› # AgentRL
 
-It is built for small-scale efficiency experiments: shared-weight LoRA policy/reference training, multiple rollout paths, profiler-friendly runtime metrics, and simple user-defined `BaseEnvironment` / `BaseVerifier` APIs.
+  AgentRL is a lightweight single-GPU framework for verifier-based GRPO style
+  post-training of language models.
 
-## Installation
+  It is designed for small-scale single-device experimentation with pluggable
+  text environments, deterministic verifiers, LoRA-based policy updates, and a
+  practical path from synthetic tasks to real benchmarks.
 
-Core install:
+  ## What AgentRL currently supports
 
-```bash
-pip install -e .
-```
+  - GRPO style post-training with LoRA adapters
+  - Pluggable text environments and deterministic verifiers
+  - Shared-weight LoRA policy/reference setup
+  - Standard rollout and continuous batching
+  - Chunked prefill in both rollout paths
+  - Persistent KV decode for cache-capable models in continuous batching
+  - CPU-backed trajectory buffering and replay
+  - Checkpoint saving during training plus a final adapter alias
+  - Metrics logging, debugger hooks, profiler utilities, and VRAM headroom
+  reporting
+  - Synthetic arithmetic task ladder and a real filtered GSM8K subset workflow
 
-Install benchmark extras for GSM8K and example scripts that depend on `datasets`:
+  ## Current Project Status
 
-```bash
-pip install -e ".[benchmark]"
-```
+  ### Implemented
 
-## Systems Overview
+  - Core GRPO loop works end to end
+  - Shared-weight LoRA policy/reference layout
+  - Continuous batching with persistent KV decode for cache-capable models
+  - Chunked prefill in standard rollout and continuous batching
+  - Trajectory replay, logging, debugger, profiler, and buffer eviction
+  - Adapter checkpoint saving and final alias
+  - Startup VRAM and headroom reporting
+  - Synthetic task ladder
+  - Real GSM8K subset path
+  - Rationale-based SFT bootstrap
+  - Strict binary verifier path for GSM8K
+  - Strict evaluation and pass@k diagnostics
+  - Test suite is green
 
-AgentRL currently focuses on single-device post-training efficiency:
+  ### Validated Experimentally
 
-- shared-weight LoRA policy/reference layout
-- standard rollout and continuous batching
-- chunked prefill in both rollout paths
-- persistent KV decode for cache-capable models in continuous batching
-- CPU-backed trajectory buffering and replay
-- checkpoint saving during training plus a final adapter alias
-- metrics logging, profiler utilities, debugger hooks, and VRAM headroom reporting
-- pluggable text environments and deterministic verifiers
+  - Single-GPU Colab smoke runs worked on real Hugging Face models
+  - On a Tesla T4 with `Qwen/Qwen2.5-1.5B-Instruct`, the systems benchmark
+  showed continuous batching reducing mean step time from `22.47s` to `8.71s`
+  and increasing throughput from `11.28` to `29.20` tokens/s on the same
+  workload
+  - Synthetic tasks produce non-degenerate reward signal
+  - Multi-step GRPO updates on synthetic tasks are real training updates, not
+  just plumbing
+  - Real filtered GSM8K subset runs work with rationale-based SFT bootstrap,
+  strict exact-match style verification, pass@k diagnostics, and GRPO fine-
+  tuning from a bootstrap adapter
+  - Persistent-KV continuous batching is implemented and unit tested
 
-The training objective is GRPO style policy optimization with a frozen reference implemented through shared base weights plus trainable LoRA adapters.
+  ### Still In Progress
 
-## Minimal Usage
+  - Runtime is better than the initial prototype, but it is not yet a paged-KV
+  or vLLM-style production decode engine
+  - Cache management and scheduling are still simpler than production serving
+  runtimes
+  - The strongest benchmark story still comes from explicit bootstrap-vs-post-
+  RL evaluation on saved adapters
+  - GSM8K training quality still depends heavily on bootstrap strength,
+  decoding budget, and subset difficulty
 
-```python
-from agentrl import GRPOConfig, GRPOTrainer
-from examples.math_env import MathEnvironment, MathVerifier
+  ## Installation
 
-config = GRPOConfig(
-    model_name="Qwen/Qwen2.5-1.5B-Instruct",
-    group_size=8,
-    batch_size=4,
-    max_new_tokens=128,
-    steps=100,
-    output_dir="./checkpoints",
-)
+  ```bash
+  pip install -e .
+  pip install datasets
+  ```
 
-trainer = GRPOTrainer(
-    config=config,
-    environment=MathEnvironment(split="smoke"),
-    verifier=MathVerifier(),
-)
+  ## Minimal Usage
 
-trainer.train()
-```
+  ```python
+  from agentrl import GRPOConfig, GRPOTrainer
+  from examples.math_env import MathEnvironment, MathVerifier
 
-CLI example:
+  config = GRPOConfig(
+      model_name="Qwen/Qwen2.5-1.5B-Instruct",
+      group_size=8,
+      batch_size=4,
+      max_new_tokens=128,
+      steps=100,
+      output_dir="./checkpoints",
+  )
 
-```bash
-python -m examples.train_math \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --steps 5 \
+  trainer = GRPOTrainer(
+      config=config,
+      environment=MathEnvironment(split="smoke"),
+      verifier=MathVerifier(),
+  )
+
+  trainer.train()
+  ```
+
+  CLI example:
+
+  ```bash
+  python -m examples.train_math --model Qwen/Qwen2.5-1.5B-Instruct --steps 5
   --split smoke
-```
+  ```
 
-## Profiling
+  ## Systems Benchmark Example
 
-AgentRL can export Chrome tracing files for the first few training steps.
+  Use the systems benchmark when you want to compare rollout implementations,
+  runtime bottlenecks, VRAM pressure, and cache reuse on a fixed workload.
 
-Config fields:
+  Comparison command:
 
-- `profile_steps`: number of initial steps to profile
-- `profile_dir`: output directory for exported traces
+  ```bash
+  python -m examples.benchmark_systems \
+    --model Qwen/Qwen2.5-1.5B-Instruct \
+    --steps 5 \
+    --batch-size 1 \
+    --group-size 4 \
+    --max-new-tokens 64 \
+    --split easy \
+    --output-dir ./systems_benchmark_compare \
+    --compare-standard-vs-continuous
+  ```
 
-Example:
+  One measured Colab T4 run on the `easy` math workload produced:
 
-```python
-config = GRPOConfig(
-    model_name="Qwen/Qwen2.5-1.5B-Instruct",
-    steps=10,
-    profile_steps=2,
-    profile_dir="./profiles",
-)
-```
+  - Standard rollout: `22.47s` mean step time, `11.28` tokens/s, diagnosis
+  `decode-limited`, bottleneck `decode_without_cache_reuse`
+  - Continuous batching: `8.71s` mean step time, `29.20` tokens/s, diagnosis
+  `decode-limited`, bottleneck `decode`
 
-This writes files such as:
+  In that comparison, continuous batching was about `2.6x` faster on mean step
+  time with near-zero padding waste in both modes. The benchmark verdict is
+  intentionally systems-focused: the same run still had zero reward under the
+  strict verifier, but it was useful for identifying decode as the dominant
+  bottleneck and quantifying the benefit of cache reuse.
 
-```text
-./profiles/step_000000_chrome_trace.json
-./profiles/step_000001_chrome_trace.json
-```
+  ## GSM8K Workflow
 
-Open them in Chrome via:
+  The current GSM8K path is:
 
-```text
-chrome://tracing
-```
+  1. Bootstrap a LoRA adapter with rationale-based supervised targets derived
+  from GSM8K solutions.
+  2. Run diagnostic evaluation to measure `pass@1` and `pass@k` before RL.
+  3. Run GRPO with a strict binary verifier only if the bootstrap model already
+  produces some correct trajectories.
+  4. Evaluate the saved GRPO adapter with strict exact match.
 
-## Runtime Metrics
+  The GSM8K verifier is intentionally strict:
 
-Per-step metrics now include runtime-oriented fields such as:
+  - reward is `1.0` only if the last non-empty line is exactly `Final answer:
+  <integer>` and the integer matches the gold answer
+  - reward is `0.0` otherwise
+  - there is no partial reward for formatting, near misses, or fallback integer
+  extraction
 
-- `generation_time_ms`, `training_time_ms`
-- `prefill_time_ms`, `decode_time_ms`
-- `tokens_per_second`
-- `prefill_tokens_per_second`, `decode_tokens_per_second`
-- `padding_ratio`, `generation_padding_ratio`, `sequence_padding_ratio`
-- `cache_reuse_effectiveness`
-- `generation_peak_vram_mb`, `rollout_peak_vram_mb`
-- `generation_runtime_headroom_mb`, `rollout_runtime_headroom_mb`
-- `learning_rate`, `mean_token_kl`, `beta`
+  Bootstrap is rationale-based rather than answer-only. The point of the
+  diagnostic stage is to answer a concrete question before spending RL compute:
+  does the bootstrap adapter produce any correct strict trajectories at all?
 
-These are written to `metrics.jsonl` and summarized by the systems benchmark script.
+  ## Recommended GSM8K Commands
 
-## Systems Benchmark
+  Bootstrap SFT:
 
-`examples/benchmark_systems.py` measures runtime behavior, not task accuracy. It runs a fixed synthetic workload and writes a `summary.json` with step-time, throughput, padding, cache reuse, and VRAM metrics.
+  ```bash
+  python -m examples.bootstrap_gsm8k_subset \
+    --model Qwen/Qwen2.5-1.5B-Instruct \
+    --epochs 3 \
+    --batch-size 4 \
+    --subset-size 128 \
+    --max-question-words 45 \
+    --curriculum easy \
+    --adapter-dir ./bootstrap_gsm8k_adapter_15b
+  ```
 
-Single-run example:
+  Diagnostic evaluation before RL:
 
-```bash
-python -m examples.benchmark_systems \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --steps 5 \
-  --batch-size 1 \
-  --group-size 4 \
-  --max-new-tokens 64 \
-  --split easy \
-  --output-dir ./systems_benchmark
-```
+  ```bash
+  python -m examples.eval_gsm8k_subset \
+    --model Qwen/Qwen2.5-1.5B-Instruct \
+    --init-adapter-path ./bootstrap_gsm8k_adapter_15b \
+    --output-dir ./eval_gsm8k_subset_15b_diag \
+    --split train \
+    --subset-size 128 \
+    --max-question-words 45 \
+    --curriculum easy \
+    --max-new-tokens 96 \
+    --num-samples 8
+  ```
 
-Comparison example:
+  GRPO training:
 
-```bash
-python -m examples.benchmark_systems \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --steps 5 \
-  --batch-size 1 \
-  --group-size 4 \
-  --max-new-tokens 64 \
-  --split easy \
-  --output-dir ./systems_benchmark_compare \
-  --compare-standard-vs-continuous
-```
+  ```bash
+  python -m examples.benchmark_gsm8k_subset \
+    --model Qwen/Qwen2.5-1.5B-Instruct \
+    --steps 10 \
+    --batch-size 1 \
+    --group-size 4 \
+    --max-new-tokens 128 \
+    --subset-size 128 \
+    --max-question-words 45 \
+    --curriculum easy \
+    --reward-mode strict \
+    --init-adapter-path ./bootstrap_gsm8k_adapter_15b \
+    --split train \
+    --output-dir ./checkpoints_gsm8k_subset_15b_rl
+  ```
 
-The generated summary includes fields such as:
+  Strict final eval:
 
-- `mean_step_time_ms`
-- `mean_generation_fraction`
-- `mean_training_fraction`
-- `mean_tokens_per_second`
-- `mean_prefill_tokens_per_second`
-- `mean_decode_tokens_per_second`
-- `mean_padding_ratio`
-- `mean_cache_reuse_effectiveness`
-- `peak_vram_mb`
-- `rollout_peak_vram_mb`
-- `min_rollout_runtime_headroom_mb`
+  ```bash
+  python -m examples.eval_gsm8k_subset \
+    --model Qwen/Qwen2.5-1.5B-Instruct \
+    --init-adapter-path ./checkpoints_gsm8k_subset_15b_rl/checkpoint_final \
+    --output-dir ./eval_gsm8k_subset_15b_rl_final \
+    --split train \
+    --subset-size 128 \
+    --max-question-words 45 \
+    --curriculum easy \
+    --max-new-tokens 128
+  ```
 
-## GSM8K Workflow
+  ## How To Interpret GSM8K Diagnostics
 
-The current GSM8K path is:
+  - If `pass@k` is near zero, RL likely has no signal.
+  - If `pass@k` is nontrivial but `pass@1` is lower, RL may help sharpen the
+  policy toward trajectories the model can already sample but not yet select
+  reliably.
+  - If many responses hit `max_new_tokens`, increase decoding budget before
+  concluding the model is too weak.
 
-1. bootstrap a LoRA adapter with rationale-based supervised targets derived from GSM8K solutions
-2. run diagnostic evaluation to measure `pass@1` and `pass@k` before RL
-3. run GRPO with a strict binary verifier only if the bootstrap model already produces some correct trajectories
-4. evaluate the saved GRPO adapter with strict exact match
+  The diagnostic evaluator writes both a compact `summary.json` and a
+  `predictions.jsonl` file with raw sampled responses, parsed terminal
+  predictions, per-sample rewards, and response lengths for inspection.
 
-The GSM8K verifier is intentionally strict:
+  ## Real GSM8K Status
 
-- reward is `1.0` only if the last non-empty line is exactly `Final answer: <integer>` and the integer matches the gold answer
-- reward is `0.0` otherwise
-- there is no partial reward for formatting, near misses, or fallback integer extraction
+  The current story is:
 
-Bootstrap is rationale-based rather than answer-only. The diagnostic stage is there to answer a practical question before spending RL compute: does the bootstrap adapter produce any correct strict trajectories at all?
+  - Cold-start strict RL on GSM8K did not work on small models.
+  - Answer-only SFT plus shaped reward produced superficially better rewards,
+  but much of that signal came from formatting behavior rather than robust
+  problem solving.
+  - Rationale-based SFT bootstrap plus a strict binary verifier produced a
+  meaningful bootstrap policy on the filtered GSM8K subset.
+  - On `Qwen/Qwen2.5-1.5B-Instruct`, bootstrap diagnostics showed:
+    - `pass@1 = 0.5156`
+    - `pass@8 = 0.7734`
+    - `fraction_with_any_correct = 0.7734`
+  - After strict binary GRPO, strict greedy evaluation reached:
+    - `pass@1 = 0.6875`
 
-### Recommended GSM8K Commands
+  This result is on a filtered easy-curriculum training subset. It is a project
+  benchmark result, not a broad GSM8K SOTA claim.
 
-Bootstrap SFT:
+  ## Benchmark Snapshot
 
-```bash
-python -m examples.bootstrap_gsm8k_subset \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --epochs 3 \
-  --batch-size 4 \
-  --subset-size 128 \
-  --max-question-words 45 \
-  --curriculum easy \
-  --adapter-dir ./bootstrap_gsm8k_adapter_15b
-```
+  | Model | Setup | Subset | Metric | Value |
+  |---|---|---|---|---|
+  | Qwen2.5-1.5B-Instruct | Rationale SFT bootstrap | GSM8K filtered train easy
+  subset | pass@1 | 0.5156 |
+  | Qwen2.5-1.5B-Instruct | Rationale SFT bootstrap | GSM8K filtered train easy
+  subset | pass@8 | 0.7734 |
+  | Qwen2.5-1.5B-Instruct | Bootstrap + strict GRPO | GSM8K filtered train easy
+  subset | pass@1 | 0.6875 |
 
-Diagnostic evaluation before RL:
+  ## Synthetic Task Ladder
 
-```bash
-python -m examples.eval_gsm8k_subset \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --init-adapter-path ./bootstrap_gsm8k_adapter_15b \
-  --output-dir ./eval_gsm8k_subset_15b_diag \
-  --split train \
-  --subset-size 128 \
-  --max-question-words 45 \
-  --curriculum easy \
-  --max-new-tokens 96 \
-  --num-samples 8
-```
+  - `smoke`: ultra-easy arithmetic for the first non-degenerate reward batch
+  - `easy`: slightly harder synthetic arithmetic before moving to benchmark-
+  style tasks
+  - `train` / `eval`: stricter arithmetic splits with more room for policy
+  improvement
+  - `gsm8k_subset`: filtered real GSM8K examples for benchmark-style
+  experiments
 
-GRPO training:
+  ## Single-GPU Playbook
 
-```bash
-python -m examples.benchmark_gsm8k_subset \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --steps 10 \
-  --batch-size 1 \
-  --group-size 4 \
-  --max-new-tokens 128 \
-  --subset-size 128 \
-  --max-question-words 45 \
-  --curriculum easy \
-  --reward-mode strict \
-  --init-adapter-path ./bootstrap_gsm8k_adapter_15b \
-  --split train \
-  --output-dir ./checkpoints_gsm8k_subset_15b_rl
-```
+  - `batch_size * group_size` is the main VRAM dial.
+  - Enable gradient checkpointing only when needed.
+  - Continuous batching helps most when sequence lengths vary across active
+  samples.
+  - Persistent KV decode is useful, but it is not yet a full paged-KV runtime.
+  - Larger `max_new_tokens` can be necessary for real reasoning tasks.
+  - If many prompt groups are all-correct or all-wrong, increase prompt batch
+  size so each optimizer step sees more than one prompt group.
 
-Strict final eval:
+  ## Current Constraints
 
-```bash
-python -m examples.eval_gsm8k_subset \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --init-adapter-path ./checkpoints_gsm8k_subset_15b_rl/checkpoint_final \
-  --output-dir ./eval_gsm8k_subset_15b_rl_final \
-  --split train \
-  --subset-size 128 \
-  --max-question-words 45 \
-  --curriculum easy \
-  --max-new-tokens 128
-```
+  - `use_lora=True` is required.
+  - The framework is single-device only.
+  - Continuous batching is not yet a full paged-KV or vLLM-style runtime.
+  - `top_p` support may still be limited depending on the code path.
+  - The strongest benchmark comparison still comes from explicit bootstrap-vs-
+  post-RL evaluation on saved adapters.
 
-### How To Interpret GSM8K Diagnostics
+  ## Security Note
 
-- if `pass@k` is near zero, RL likely has no signal
-- if `pass@k` is nontrivial but `pass@1` is lower, RL may help sharpen the policy toward trajectories the model can already sample but not yet select reliably
-- if many responses hit `max_new_tokens`, increase decoding budget before concluding the model is too weak
-
-The diagnostic evaluator writes both a compact `summary.json` and a `predictions.jsonl` file with raw sampled responses, parsed terminal predictions, per-sample rewards, and response lengths for inspection.
-
-## Benchmark Snapshot (Accuracy)
-
-The following result is on a filtered easy-curriculum training subset. It is a project benchmark result, not a broad GSM8K SOTA claim.
-
-| Model | Setup | Subset | Metric | Value |
-|---|---|---|---|---|
-| Qwen2.5-1.5B-Instruct | Rationale SFT bootstrap | GSM8K filtered train easy subset | pass@1 | 0.5156 |
-| Qwen2.5-1.5B-Instruct | Rationale SFT bootstrap | GSM8K filtered train easy subset | pass@8 | 0.7734 |
-| Qwen2.5-1.5B-Instruct | Bootstrap + strict GRPO | GSM8K filtered train easy subset | pass@1 | 0.6875 |
-
-## Systems Benchmark (Throughput / VRAM)
-
-The systems benchmark measures runtime, batching efficiency, cache reuse, and memory headroom. It is not an accuracy benchmark.
-
-Use `examples/benchmark_systems.py` when you want to compare:
-
-- standard rollout vs continuous batching
-- prefill vs decode bottlenecks
-- padding waste under different batching choices
-- VRAM headroom on a fixed workload
-
-## Real GSM8K Status
-
-The current story is:
-
-- cold-start strict RL on GSM8K did not work on small models
-- answer-only SFT plus shaped reward produced superficially better rewards, but much of that signal came from formatting behavior rather than robust problem solving
-- rationale-based SFT bootstrap plus a strict binary verifier produced a meaningful bootstrap policy on the filtered GSM8K subset
-- on `Qwen/Qwen2.5-1.5B-Instruct`, bootstrap diagnostics showed:
-  - `pass@1 = 0.5156`
-  - `pass@8 = 0.7734`
-  - `fraction_with_any_correct = 0.7734`
-- after strict binary GRPO, strict greedy evaluation reached:
-  - `pass@1 = 0.6875`
-
-## Synthetic Task Ladder
-
-- `smoke`: ultra-easy arithmetic for the first non-degenerate reward batch
-- `easy`: slightly harder synthetic arithmetic before moving to benchmark-style tasks
-- `train` / `eval`: stricter arithmetic splits with more room for policy improvement
-- `gsm8k_subset`: filtered real GSM8K examples for benchmark-style experiments
-
-## Single-GPU Playbook
-
-- `batch_size * group_size` is the main VRAM dial
-- enable gradient checkpointing only when needed
-- continuous batching helps most when sequence lengths vary across active samples
-- persistent KV decode is useful, but it is not yet a full paged-KV runtime
-- larger `max_new_tokens` can be necessary for real reasoning tasks
-- if many prompt groups are all-correct or all-wrong, increase prompt batch size so each optimizer step sees more than one prompt group
-
-## Current Constraints
-
-- `use_lora=True` is required
-- the framework is single-device only
-- continuous batching is not yet a full paged-KV or vLLM-style runtime
-- `top_p` support may still be limited depending on the code path
-- the strongest benchmark comparison still comes from explicit bootstrap-vs-post-RL evaluation on saved adapters
-- the config surface already includes experimental flags for async rollout workers, async trajectory copy, and vLLM rollout, but those paths are reserved and currently raise `NotImplementedError` when enabled
-
-## Security Note
-
-- replay trajectories are loaded with `torch.load(..., weights_only=False)`; do not load untrusted trajectory files
+  - Replay trajectories are loaded with `torch.load(..., weights_only=False)`.
+  Do not load untrusted trajectory files.
