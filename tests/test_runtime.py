@@ -102,3 +102,26 @@ def test_execution_controller_reduces_chunk_size_after_padding_streak() -> None:
     assert config.chunk_size == 4
     assert second["last_runtime_adjustment_reason"] == "high_padding_chunk_size"
     assert second["dominant_runtime_bottleneck"] == "padding"
+
+
+def test_execution_controller_reports_kv_budget_pressure() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        use_continuous_batching=True,
+    )
+    controller = ExecutionController(config=config, device=SimpleNamespace(type="cpu"))
+
+    metrics = controller.observe(
+        {
+            "prefill_time_ms": 10.0,
+            "decode_time_ms": 12.0,
+            "cache_reuse_effectiveness": 0.8,
+            "padding_ratio": 0.05,
+            "scheduler_prefill_kv_pressure": 0.25,
+            "scheduler_decode_kv_pressure": 0.96,
+        }
+    )
+
+    assert metrics["dominant_runtime_bottleneck"] == "kv_budget"
+    assert metrics["scheduler_kv_pressure"] == 0.96
+    assert "KV-cache budget" in str(metrics["runtime_recommendation"])

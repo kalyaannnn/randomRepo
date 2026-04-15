@@ -69,7 +69,12 @@ class PrefixVerifier(BaseVerifier):
 class StepModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(use_cache=False)
+        self.config = SimpleNamespace(
+            use_cache=False,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            hidden_size=8,
+        )
         self.anchor = torch.nn.Parameter(torch.zeros(1))
 
     def generate_step(self, active_sequences: list[torch.Tensor], active_indices: list[int]) -> list[int]:
@@ -102,10 +107,46 @@ class Layout:
         return torch.zeros((batch, seq, 256), dtype=torch.float32)
 
 
+class ConstantStepModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(
+            use_cache=False,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            hidden_size=8,
+        )
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+    def generate_step(self, active_sequences: list[torch.Tensor], active_indices: list[int]) -> list[int]:
+        del active_sequences
+        return [ord("a")] * len(active_indices)
+
+
+class ConstantLayout:
+    def __init__(self) -> None:
+        self.model = ConstantStepModel()
+
+    def policy_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+    def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+
 class ChunkedStepModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(use_cache=False)
+        self.config = SimpleNamespace(
+            use_cache=False,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            hidden_size=8,
+        )
         self.anchor = torch.nn.Parameter(torch.zeros(1))
         self.prefill_calls: list[tuple[int, int | None]] = []
         self.decode_calls: list[tuple[int, int | None, int]] = []
@@ -157,7 +198,12 @@ class ChunkedLayout:
 class DynamicCacheStepModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(use_cache=False)
+        self.config = SimpleNamespace(
+            use_cache=False,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            hidden_size=8,
+        )
         self.anchor = torch.nn.Parameter(torch.zeros(1))
 
     def forward(
@@ -236,6 +282,14 @@ def test_continuous_batching_collects_and_reports_padding_ratio() -> None:
     assert "decode_time_ms" in batch.metadata
     assert "decode_tokens_per_second" in batch.metadata
     assert "cache_reuse_effectiveness" in batch.metadata
+    assert "scheduler_prefill_token_budget" in batch.metadata
+    assert "scheduler_decode_token_budget" in batch.metadata
+    assert "scheduler_max_concurrent_sequences" in batch.metadata
+    assert "scheduler_prefill_kv_budget_mb" in batch.metadata
+    assert "scheduler_decode_kv_budget_mb" in batch.metadata
+    assert "scheduler_decode_admitted_kv_mb" in batch.metadata
+    assert batch.metadata["scheduler_prefill_kv_budget_mb"] > 0.0
+    assert batch.metadata["scheduler_decode_kv_budget_mb"] > 0.0
 
 
 def test_continuous_batching_uses_chunked_prefill_for_long_prompts() -> None:
@@ -267,6 +321,36 @@ def test_continuous_batching_uses_chunked_prefill_for_long_prompts() -> None:
     assert first_decode[:2] == (2, 1)
     assert second_decode[:2] == (2, 1)
     assert second_decode[2] == first_decode[2] + 1
+
+
+def test_continuous_scheduler_defers_sequences_under_safe_policy() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=4,
+        chunk_size=2,
+        max_new_tokens=1,
+        prefill_chunk_size=32,
+        execution_policy="safe",
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=ConstantLayout(),
+        device=torch.device("cpu"),
+    )
+
+    prompts = ["x" * length for length in (10, 11, 12, 13)]
+    responses, padding_ratio = orchestrator._generate_active_batch(prompts)
+
+    assert responses == ["a", "a", "a", "a"]
+    assert 0.0 <= padding_ratio <= 1.0
+    assert orchestrator._runtime_stats["scheduler_decode_passes"] >= 2.0
+    assert orchestrator._runtime_stats["scheduler_deferred_sequences"] > 0.0
+    assert orchestrator._runtime_stats["scheduler_max_concurrent_sequences"] < 4.0
 
 
 @pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")

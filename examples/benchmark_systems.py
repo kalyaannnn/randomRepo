@@ -108,6 +108,33 @@ def _summarize_run(history: list[dict[str, float]], config: GRPOConfig, split: s
         "mean_generation_padding_ratio": mean(float(row.get("generation_padding_ratio", 0.0)) for row in history),
         "mean_sequence_padding_ratio": mean(float(row.get("sequence_padding_ratio", 0.0)) for row in history),
         "mean_cache_reuse_effectiveness": mean(float(row.get("cache_reuse_effectiveness", 0.0)) for row in history),
+        "mean_scheduler_prefill_passes": mean(float(row.get("scheduler_prefill_passes", 0.0)) for row in history),
+        "mean_scheduler_decode_passes": mean(float(row.get("scheduler_decode_passes", 0.0)) for row in history),
+        "mean_scheduler_prefill_kv_budget_mb": mean(
+            float(row.get("scheduler_prefill_kv_budget_mb", 0.0)) for row in history
+        ),
+        "mean_scheduler_decode_kv_budget_mb": mean(
+            float(row.get("scheduler_decode_kv_budget_mb", 0.0)) for row in history
+        ),
+        "mean_scheduler_prefill_admitted_kv_mb": mean(
+            float(row.get("scheduler_prefill_admitted_kv_mb", 0.0)) for row in history
+        ),
+        "mean_scheduler_decode_admitted_kv_mb": mean(
+            float(row.get("scheduler_decode_admitted_kv_mb", 0.0)) for row in history
+        ),
+        "mean_scheduler_kv_pressure": mean(
+            max(
+                float(row.get("scheduler_prefill_kv_pressure", 0.0)),
+                float(row.get("scheduler_decode_kv_pressure", 0.0)),
+            )
+            for row in history
+        ),
+        "mean_scheduler_deferred_sequences": mean(
+            float(row.get("scheduler_deferred_sequences", 0.0)) for row in history
+        ),
+        "mean_scheduler_max_concurrent_sequences": mean(
+            float(row.get("scheduler_max_concurrent_sequences", 0.0)) for row in history
+        ),
         "peak_vram_mb": max(float(row.get("peak_vram_mb", 0.0)) for row in history),
         "rollout_peak_vram_mb": max(float(row.get("rollout_peak_vram_mb", 0.0)) for row in history),
         "min_rollout_runtime_headroom_mb": min(float(row.get("rollout_runtime_headroom_mb", 0.0)) for row in history),
@@ -134,6 +161,8 @@ def _diagnose_run(
         return "memory-constrained but recoverable"
     if dominant_bottleneck == "padding":
         return "padding-limited"
+    if dominant_bottleneck == "kv_budget":
+        return "kv-budget-limited"
     if dominant_bottleneck in {"decode", "decode_without_cache_reuse"}:
         return "decode-limited"
     if dominant_bottleneck == "prefill":
@@ -227,15 +256,17 @@ def _render_comparison_table(summaries: list[dict[str, object]]) -> str:
     """Render a tiny markdown comparison table for stdout."""
 
     lines = [
-        "| Mode | Mean step ms | Tokens/s | Padding ratio | Runtime diagnosis | Bottleneck | Adjusted steps | Peak VRAM MB |",
-        "|---|---:|---:|---:|---|---|---:|---:|",
+        "| Mode | Mean step ms | Tokens/s | Padding ratio | KV pressure | Deferred seqs | Max concurrent | Runtime diagnosis | Bottleneck | Adjusted steps | Peak VRAM MB |",
+        "|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|",
     ]
     for summary in summaries:
         mode = "continuous" if summary["use_continuous_batching"] else "standard"
         lines.append(
             "| "
             f"{mode} | {summary['mean_step_time_ms']:.2f} | {summary['mean_tokens_per_second']:.2f} | "
-            f"{summary['mean_padding_ratio']:.4f} | {summary['efficiency_diagnosis']} | "
+            f"{summary['mean_padding_ratio']:.4f} | {summary['mean_scheduler_kv_pressure']:.2f} | "
+            f"{summary['mean_scheduler_deferred_sequences']:.2f} | "
+            f"{summary['mean_scheduler_max_concurrent_sequences']:.2f} | {summary['efficiency_diagnosis']} | "
             f"{summary['dominant_runtime_bottleneck']} | {summary['steps_with_runtime_adjustment']} | "
             f"{summary['peak_vram_mb']:.2f} |"
         )

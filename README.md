@@ -13,26 +13,28 @@
   - GRPO style post-training with LoRA adapters
   - Pluggable text environments and deterministic verifiers
   - Shared-weight LoRA policy/reference setup
-  - Standard rollout and continuous batching
-  - Chunked prefill in both rollout paths
-  - Persistent KV decode for cache-capable models in continuous batching
-  - CPU-backed trajectory buffering and replay
-  - Checkpoint saving during training plus a final adapter alias
-  - Metrics logging, debugger hooks, profiler utilities, and VRAM headroom
-  reporting
+- Standard rollout and continuous batching
+- Chunked prefill in both rollout paths
+- Persistent KV decode for cache-capable models in continuous batching
+- Execution-policy-aware continuous scheduling with token and KV-budgeted admission
+- CPU-backed trajectory buffering and replay
+- Checkpoint saving during training plus a final adapter alias
+- Metrics logging, debugger hooks, profiler utilities, and VRAM headroom
+reporting
   - Synthetic arithmetic task ladder and a real filtered GSM8K subset workflow
 
   ## Current Project Status
 
   ### Implemented
 
-  - Core GRPO loop works end to end
-  - Shared-weight LoRA policy/reference layout
-  - Continuous batching with persistent KV decode for cache-capable models
-  - Chunked prefill in standard rollout and continuous batching
-  - Trajectory replay, logging, debugger, profiler, and buffer eviction
-  - Adapter checkpoint saving and final alias
-  - Startup VRAM and headroom reporting
+- Core GRPO loop works end to end
+- Shared-weight LoRA policy/reference layout
+- Continuous batching with persistent KV decode for cache-capable models
+- Execution-policy-aware continuous scheduler with token-budgeted and KV-aware admission
+- Chunked prefill in standard rollout and continuous batching
+- Trajectory replay, logging, debugger, profiler, and buffer eviction
+- Adapter checkpoint saving and final alias
+- Startup VRAM and headroom reporting
   - Synthetic task ladder
   - Real GSM8K subset path
   - Rationale-based SFT bootstrap
@@ -57,13 +59,13 @@
 
   ### Still In Progress
 
-  - Runtime is better than the initial prototype, but it is not yet a paged-KV
+- Runtime is better than the initial prototype, but it is not yet a paged-KV
   or vLLM-style production decode engine
-  - Cache management and scheduling are still simpler than production serving
-  runtimes
-  - The strongest benchmark story still comes from explicit bootstrap-vs-post-
+- Cache management and scheduling are more memory-aware than the earlier
+  prototype, but they are still simpler than production serving runtimes
+- The strongest benchmark story still comes from explicit bootstrap-vs-post-
   RL evaluation on saved adapters
-  - GSM8K training quality still depends heavily on bootstrap strength,
+- GSM8K training quality still depends heavily on bootstrap strength,
   decoding budget, and subset difficulty
 
   ## Installation
@@ -106,8 +108,9 @@
 
   ## Systems Benchmark Example
 
-  Use the systems benchmark when you want to compare rollout implementations,
-  runtime bottlenecks, VRAM pressure, and cache reuse on a fixed workload.
+Use the systems benchmark when you want to compare rollout implementations,
+runtime bottlenecks, VRAM pressure, cache reuse, and scheduler KV pressure on a
+fixed workload.
 
   Comparison command:
 
@@ -135,6 +138,14 @@
   intentionally systems-focused: the same run still had zero reward under the
   strict verifier, but it was useful for identifying decode as the dominant
   bottleneck and quantifying the benefit of cache reuse.
+
+  Recent runtime instrumentation also reports:
+
+  - scheduler prefill and decode passes
+  - deferred sequences and peak concurrent active sequences
+  - scheduler KV-budget estimates, admitted KV load, and normalized KV pressure
+  - `kv_budget` as a distinct runtime bottleneck when admission runs close to
+    the configured KV-cache budget
 
   ## GSM8K Workflow
 

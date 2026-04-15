@@ -176,6 +176,48 @@ class GRPOTrainer:
                 system_metrics["cache_reuse_effectiveness"] = float(
                     batch.metadata.get("cache_reuse_effectiveness", 0.0)
                 )
+                system_metrics["scheduler_prefill_token_budget"] = float(
+                    batch.metadata.get("scheduler_prefill_token_budget", 0.0)
+                )
+                system_metrics["scheduler_decode_token_budget"] = float(
+                    batch.metadata.get("scheduler_decode_token_budget", 0.0)
+                )
+                system_metrics["scheduler_prefill_passes"] = float(
+                    batch.metadata.get("scheduler_prefill_passes", 0.0)
+                )
+                system_metrics["scheduler_decode_passes"] = float(
+                    batch.metadata.get("scheduler_decode_passes", 0.0)
+                )
+                system_metrics["scheduler_prefill_admitted_sequences"] = float(
+                    batch.metadata.get("scheduler_prefill_admitted_sequences", 0.0)
+                )
+                system_metrics["scheduler_decode_admitted_sequences"] = float(
+                    batch.metadata.get("scheduler_decode_admitted_sequences", 0.0)
+                )
+                system_metrics["scheduler_prefill_kv_budget_mb"] = float(
+                    batch.metadata.get("scheduler_prefill_kv_budget_mb", 0.0)
+                )
+                system_metrics["scheduler_decode_kv_budget_mb"] = float(
+                    batch.metadata.get("scheduler_decode_kv_budget_mb", 0.0)
+                )
+                system_metrics["scheduler_prefill_admitted_kv_mb"] = float(
+                    batch.metadata.get("scheduler_prefill_admitted_kv_mb", 0.0)
+                )
+                system_metrics["scheduler_decode_admitted_kv_mb"] = float(
+                    batch.metadata.get("scheduler_decode_admitted_kv_mb", 0.0)
+                )
+                system_metrics["scheduler_prefill_kv_pressure"] = float(
+                    batch.metadata.get("scheduler_prefill_kv_pressure", 0.0)
+                )
+                system_metrics["scheduler_decode_kv_pressure"] = float(
+                    batch.metadata.get("scheduler_decode_kv_pressure", 0.0)
+                )
+                system_metrics["scheduler_deferred_sequences"] = float(
+                    batch.metadata.get("scheduler_deferred_sequences", 0.0)
+                )
+                system_metrics["scheduler_max_concurrent_sequences"] = float(
+                    batch.metadata.get("scheduler_max_concurrent_sequences", 0.0)
+                )
                 system_metrics["rollout_peak_vram_mb"] = float(system_metrics.get("generation_peak_vram_mb", 0.0))
                 system_metrics["rollout_runtime_headroom_mb"] = float(
                     system_metrics.get("generation_runtime_headroom_mb", 0.0)

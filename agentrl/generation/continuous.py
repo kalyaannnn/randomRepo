@@ -12,6 +12,11 @@ from torch import nn
 
 from agentrl.core.base import BaseEnvironment
 from agentrl.core.rollout import RolloutBatch, RolloutOrchestrator
+from agentrl.generation.scheduler import (
+    dtype_bytes,
+    estimate_kv_cache_sequence_bytes,
+    kv_cache_geometry,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -30,6 +35,31 @@ class _EpisodeState:
     reward: float = 0.0
     transcript_text: str = ""
     assistant_spans: list[tuple[int, int]] | None = None
+
+
+@dataclass(slots=True)
+class _ScheduledSequence:
+    """Tokenized prompt state tracked by the continuous scheduler."""
+
+    original_index: int
+    prompt_ids: torch.Tensor
+    prompt_mask: torch.Tensor
+
+    @property
+    def prompt_tokens(self) -> int:
+        return int(self.prompt_mask.sum().item())
+
+
+@dataclass(slots=True)
+class _ContinuousSchedulerState:
+    """Execution-policy-driven admission state for continuous rollout."""
+
+    max_batch_size: int
+    prefill_token_budget: int
+    decode_token_budget: int
+    prefill_cost_budget: int
+    decode_cost_budget: int
+    kv_bytes_per_token: int | None = None
 
 
 class ContinuousBatchingOrchestrator(RolloutOrchestrator):
@@ -178,50 +208,88 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             prompt_ids = truncated_ids
             prompt_masks = truncated_masks
 
+        scheduler = self._build_scheduler_state(active_count=len(prompt_ids))
+        scheduled_sequences = [
+            _ScheduledSequence(
+                original_index=index,
+                prompt_ids=prompt,
+                prompt_mask=mask,
+            )
+            for index, (prompt, mask) in enumerate(zip(prompt_ids, prompt_masks, strict=True))
+        ]
+        self._runtime_stats["scheduler_prefill_token_budget"] += float(scheduler.prefill_token_budget)
+        self._runtime_stats["scheduler_decode_token_budget"] += float(scheduler.decode_token_budget)
+        self._runtime_stats["scheduler_prefill_kv_budget_mb"] += self._bytes_to_mb(scheduler.prefill_cost_budget)
+        self._runtime_stats["scheduler_decode_kv_budget_mb"] += self._bytes_to_mb(scheduler.decode_cost_budget)
+
         generation_model = self.layout.model
         if self._supports_persistent_kv_decode(generation_model):
-            return self._generate_active_batch_with_cache(prompt_ids, prompt_masks)
-        return self._generate_active_batch_without_cache(prompt_ids, prompt_masks)
+            return self._generate_active_batch_with_cache(scheduled_sequences, scheduler)
+        return self._generate_active_batch_without_cache(scheduled_sequences, scheduler)
 
     def _generate_active_batch_with_cache(
         self,
-        prompt_ids: list[torch.Tensor],
-        prompt_masks: list[torch.Tensor],
+        scheduled_sequences: list[_ScheduledSequence],
+        scheduler: _ContinuousSchedulerState,
     ) -> tuple[list[str], float]:
         """Generate with persistent per-sequence KV caches across active decoding."""
 
         generation_model = self.layout.model
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
-
-        generated_ids = [torch.empty(0, dtype=torch.long, device=self.device) for _ in prompt_ids]
-        finished = [False for _ in prompt_ids]
-        sequence_lengths = [int(mask.sum().item()) for mask in prompt_masks]
+        generated_ids = [
+            torch.empty(0, dtype=torch.long, device=self.device)
+            for _ in scheduled_sequences
+        ]
+        finished = [False for _ in scheduled_sequences]
+        generated_steps = [0 for _ in scheduled_sequences]
+        sequence_lengths = [sequence.prompt_tokens for sequence in scheduled_sequences]
+        sequence_caches: list[Any | None] = [None for _ in scheduled_sequences]
+        next_logits_by_index: dict[int, torch.Tensor] = {}
         self._runtime_stats["prefill_tokens"] += float(sum(sequence_lengths))
+
         prefill_start = time.perf_counter()
-        sequence_caches, next_logits = self._prefill_prompt_caches(generation_model, prompt_ids, prompt_masks)
+        for batch in self._iter_scheduled_prefill_batches(scheduled_sequences, scheduler):
+            prompt_ids = [sequence.prompt_ids for sequence in batch]
+            prompt_masks = [sequence.prompt_mask for sequence in batch]
+            batch_caches, batch_logits = self._prefill_prompt_caches(generation_model, prompt_ids, prompt_masks)
+            for offset, sequence in enumerate(batch):
+                sequence_caches[sequence.original_index] = batch_caches[offset]
+                next_logits_by_index[sequence.original_index] = batch_logits[offset : offset + 1]
         self._runtime_stats["prefill_time_ms"] += (time.perf_counter() - prefill_start) * 1000.0
-        next_logits_by_index = {
-            index: next_logits[index : index + 1]
-            for index in range(len(prompt_ids))
-        }
 
         total_padding_tokens = 0
         total_step_tokens = 0
         decode_start = time.perf_counter()
-
-        for _ in range(self.config.max_new_tokens):
-            active_indices = [index for index, is_finished in enumerate(finished) if not is_finished]
+        while True:
+            active_indices = [
+                index
+                for index, is_finished in enumerate(finished)
+                if not is_finished and generated_steps[index] < self.config.max_new_tokens
+            ]
             if not active_indices:
                 break
 
-            active_logits = torch.cat([next_logits_by_index[index] for index in active_indices], dim=0)
+            admitted_indices = self._select_admitted_indices(
+                candidate_indices=active_indices,
+                estimated_tokens={index: sequence_lengths[index] for index in active_indices},
+                estimated_costs={
+                    index: self._estimate_sequence_kv_cost(sequence_lengths[index], scheduler)
+                    for index in active_indices
+                },
+                cost_budget=scheduler.decode_cost_budget,
+                max_batch_size=scheduler.max_batch_size,
+                phase="decode",
+                scheduler=scheduler,
+            )
+            active_logits = torch.cat([next_logits_by_index[index] for index in admitted_indices], dim=0)
             next_tokens = self._sample_next_token(active_logits)
 
             decode_buckets: dict[int, list[tuple[int, torch.Tensor]]] = {}
-            for batch_offset, episode_index in enumerate(active_indices):
+            for batch_offset, episode_index in enumerate(admitted_indices):
                 token_tensor = next_tokens[batch_offset : batch_offset + 1].to(dtype=torch.long, device=self.device)
                 generated_ids[episode_index] = torch.cat((generated_ids[episode_index], token_tensor), dim=0)
                 self._runtime_stats["decode_tokens"] += float(token_tensor.numel())
+                generated_steps[episode_index] += 1
                 token = int(token_tensor.item())
                 if eos_token_id is not None and token == eos_token_id:
                     finished[episode_index] = True
@@ -231,7 +299,12 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             if not decode_buckets:
                 break
 
-            next_logits_by_index = {}
+            deferred_logits = {
+                index: next_logits_by_index[index]
+                for index in active_indices
+                if index not in admitted_indices
+            }
+            next_logits_by_index = deferred_logits
             for sequence_length, bucket in decode_buckets.items():
                 total_step_tokens += sequence_length * len(bucket)
                 self._runtime_stats["cache_reuse_tokens"] += float(sequence_length * len(bucket))
@@ -261,20 +334,29 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         self._runtime_stats["generation_padding_waste_tokens"] += float(total_padding_tokens)
         self._runtime_stats["generation_padding_total_tokens"] += float(total_step_tokens)
 
-        decoded = [self._postprocess_response(self.tokenizer.decode(tokens, skip_special_tokens=True)) for tokens in generated_ids]
+        decoded = [
+            self._postprocess_response(self.tokenizer.decode(tokens, skip_special_tokens=True))
+            for tokens in generated_ids
+        ]
         padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
         return decoded, padding_ratio
 
     def _generate_active_batch_without_cache(
         self,
-        prompt_ids: list[torch.Tensor],
-        prompt_masks: list[torch.Tensor],
+        scheduled_sequences: list[_ScheduledSequence],
+        scheduler: _ContinuousSchedulerState,
     ) -> tuple[list[str], float]:
         """Fallback generation path for models without a cache-aware forward."""
 
+        prompt_ids = [sequence.prompt_ids for sequence in scheduled_sequences]
+        prompt_masks = [sequence.prompt_mask for sequence in scheduled_sequences]
         current_ids = [prompt.clone() for prompt in prompt_ids]
-        generated_ids = [torch.empty(0, dtype=torch.long, device=self.device) for _ in prompt_ids]
-        finished = [False for _ in prompt_ids]
+        generated_ids = [
+            torch.empty(0, dtype=torch.long, device=self.device)
+            for _ in scheduled_sequences
+        ]
+        finished = [False for _ in scheduled_sequences]
+        generated_steps = [0 for _ in scheduled_sequences]
         self._runtime_stats["prefill_tokens"] += float(sum(int(mask.sum().item()) for mask in prompt_masks))
 
         total_padding_tokens = 0
@@ -290,25 +372,47 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 finished=finished,
             )
             self._runtime_stats["prefill_time_ms"] += (time.perf_counter() - prefill_start) * 1000.0
-            self._runtime_stats["decode_tokens"] += float(sum(int(tokens.numel()) for tokens in generated_ids))
+            initial_decode_tokens = sum(int(tokens.numel()) for tokens in generated_ids)
+            self._runtime_stats["decode_tokens"] += float(initial_decode_tokens)
+            for index, tokens in enumerate(generated_ids):
+                generated_steps[index] = int(tokens.numel())
+                if finished[index]:
+                    continue
 
         decode_start = time.perf_counter()
-        for _ in range(self.config.max_new_tokens):
-            active_indices = [index for index, is_finished in enumerate(finished) if not is_finished]
+        while True:
+            active_indices = [
+                index
+                for index, is_finished in enumerate(finished)
+                if not is_finished and generated_steps[index] < self.config.max_new_tokens
+            ]
             if not active_indices:
                 break
 
-            active_sequences = [current_ids[index] for index in active_indices]
+            admitted_indices = self._select_admitted_indices(
+                candidate_indices=active_indices,
+                estimated_tokens={index: int(current_ids[index].numel()) for index in active_indices},
+                estimated_costs={
+                    index: self._estimate_sequence_kv_cost(int(current_ids[index].numel()), scheduler)
+                    for index in active_indices
+                },
+                cost_budget=scheduler.decode_cost_budget,
+                max_batch_size=scheduler.max_batch_size,
+                phase="decode",
+                scheduler=scheduler,
+            )
+            active_sequences = [current_ids[index] for index in admitted_indices]
             max_length = max(sequence.numel() for sequence in active_sequences)
             total_step_tokens += max_length * len(active_sequences)
             total_padding_tokens += sum(max_length - int(sequence.numel()) for sequence in active_sequences)
 
-            next_tokens = self._sample_next_tokens(active_sequences, active_indices)
-            for batch_offset, episode_index in enumerate(active_indices):
+            next_tokens = self._sample_next_tokens(active_sequences, admitted_indices)
+            for batch_offset, episode_index in enumerate(admitted_indices):
                 token = int(next_tokens[batch_offset].item())
                 token_tensor = torch.tensor([token], dtype=torch.long, device=self.device)
                 generated_ids[episode_index] = torch.cat((generated_ids[episode_index], token_tensor), dim=0)
                 current_ids[episode_index] = torch.cat((current_ids[episode_index], token_tensor), dim=0)
+                generated_steps[episode_index] += 1
                 self._runtime_stats["decode_tokens"] += 1.0
                 if token == getattr(self.tokenizer, "eos_token_id", None):
                     finished[episode_index] = True
@@ -319,6 +423,158 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         decoded = [self._postprocess_response(self.tokenizer.decode(tokens, skip_special_tokens=True)) for tokens in generated_ids]
         padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
         return decoded, padding_ratio
+
+    def _build_scheduler_state(self, active_count: int) -> _ContinuousSchedulerState:
+        """Build an execution-policy-aware scheduler budget for one active turn."""
+
+        max_batch_size = max(1, min(int(self.config.chunk_size or self.config.group_size), active_count))
+        policy_factor = {
+            "safe": 0.5,
+            "balanced": 1.0,
+            "max_throughput": 1.5,
+        }[self.config.execution_policy]
+        prompt_window = int(self.config.max_prompt_tokens or self.config.prefill_chunk_size)
+        prefill_budget = max(
+            self.config.prefill_chunk_size,
+            int(max_batch_size * self.config.prefill_chunk_size * policy_factor),
+        )
+        decode_budget = max(
+            prompt_window,
+            int(max_batch_size * prompt_window * policy_factor),
+        )
+        model_config = getattr(self.layout.model, "config", None)
+        kv_bytes = None
+        if model_config is not None:
+            try:
+                num_layers, num_heads, head_dim = kv_cache_geometry(model_config)
+                kv_bytes = estimate_kv_cache_sequence_bytes(
+                    sequence_tokens=1,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    dtype_bytes=dtype_bytes(self.config.dtype),
+                )
+            except AttributeError:
+                kv_bytes = None
+        return _ContinuousSchedulerState(
+            max_batch_size=max_batch_size,
+            prefill_token_budget=prefill_budget,
+            decode_token_budget=decode_budget,
+            prefill_cost_budget=(
+                prefill_budget * kv_bytes if kv_bytes is not None else prefill_budget
+            ),
+            decode_cost_budget=(
+                decode_budget * kv_bytes if kv_bytes is not None else decode_budget
+            ),
+            kv_bytes_per_token=kv_bytes,
+        )
+
+    def _iter_scheduled_prefill_batches(
+        self,
+        scheduled_sequences: list[_ScheduledSequence],
+        scheduler: _ContinuousSchedulerState,
+    ) -> list[list[_ScheduledSequence]]:
+        """Split prompt prefill into token-budgeted admission waves."""
+
+        ordered = sorted(
+            scheduled_sequences,
+            key=lambda sequence: (sequence.prompt_tokens, sequence.original_index),
+        )
+        batches: list[list[_ScheduledSequence]] = []
+        start = 0
+        while start < len(ordered):
+            remaining = ordered[start:]
+            admitted_positions = self._select_admitted_indices(
+                candidate_indices=list(range(len(remaining))),
+                estimated_tokens={index: remaining[index].prompt_tokens for index in range(len(remaining))},
+                estimated_costs={
+                    index: self._estimate_sequence_kv_cost(remaining[index].prompt_tokens, scheduler)
+                    for index in range(len(remaining))
+                },
+                cost_budget=scheduler.prefill_cost_budget,
+                max_batch_size=scheduler.max_batch_size,
+                phase="prefill",
+                scheduler=scheduler,
+            )
+            batch = [remaining[index] for index in admitted_positions]
+            batches.append(batch)
+            start += len(batch)
+        return batches
+
+    def _select_admitted_indices(
+        self,
+        candidate_indices: list[int],
+        estimated_tokens: dict[int, int],
+        estimated_costs: dict[int, int],
+        cost_budget: int,
+        max_batch_size: int,
+        phase: str,
+        scheduler: _ContinuousSchedulerState,
+    ) -> list[int]:
+        """Greedily admit a fair cost-budgeted subset and record scheduler stats."""
+
+        if not candidate_indices:
+            return []
+
+        if phase == "decode":
+            ordered_candidates = sorted(
+                candidate_indices,
+                key=lambda index: (estimated_tokens[index], index),
+            )
+        else:
+            ordered_candidates = list(candidate_indices)
+
+        admitted: list[int] = []
+        used_cost = 0
+        for index in ordered_candidates:
+            if len(admitted) >= max_batch_size:
+                break
+            estimate = max(1, int(estimated_costs[index]))
+            if admitted and used_cost + estimate > cost_budget:
+                continue
+            admitted.append(index)
+            used_cost += estimate
+
+        if not admitted:
+            admitted = [ordered_candidates[0]]
+        elif (
+            phase == "decode"
+            and self.config.execution_policy != "safe"
+            and len(candidate_indices) <= max_batch_size
+        ):
+            admitted = list(ordered_candidates[:max_batch_size])
+
+        deferred = max(0, len(candidate_indices) - len(admitted))
+        self._runtime_stats[f"scheduler_{phase}_passes"] += 1.0
+        self._runtime_stats[f"scheduler_{phase}_admitted_sequences"] += float(len(admitted))
+        self._runtime_stats["scheduler_deferred_sequences"] += float(deferred)
+        self._runtime_stats["scheduler_max_concurrent_sequences"] = max(
+            float(self._runtime_stats["scheduler_max_concurrent_sequences"]),
+            float(len(admitted)),
+        )
+        admitted_cost_mb = self._bytes_to_mb(used_cost) if scheduler.kv_bytes_per_token is not None else 0.0
+        budget_cost_mb = self._bytes_to_mb(cost_budget) if scheduler.kv_bytes_per_token is not None else 0.0
+        self._runtime_stats[f"scheduler_{phase}_admitted_kv_mb"] += admitted_cost_mb
+        self._runtime_stats[f"scheduler_{phase}_kv_pressure"] += (
+            admitted_cost_mb / budget_cost_mb
+        ) if budget_cost_mb > 0 else 0.0
+        return admitted
+
+    def _estimate_sequence_kv_cost(
+        self,
+        sequence_tokens: int,
+        scheduler: _ContinuousSchedulerState,
+    ) -> int:
+        """Estimate scheduler admission cost for one sequence."""
+
+        if scheduler.kv_bytes_per_token is None:
+            return max(1, int(sequence_tokens))
+        return max(1, int(sequence_tokens)) * scheduler.kv_bytes_per_token
+
+    def _bytes_to_mb(self, value: int) -> float:
+        """Convert a byte estimate to megabytes for reporting."""
+
+        return float(value) / (1024.0 * 1024.0)
 
     def _prefill_prompt_caches(
         self,
