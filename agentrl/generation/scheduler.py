@@ -7,6 +7,56 @@ from typing import Any
 import torch
 
 
+def dtype_bytes(dtype: str) -> int:
+    """Return bytes per scalar for supported runtime dtypes."""
+
+    return {"float16": 2, "bfloat16": 2, "float32": 4}.get(dtype, 2)
+
+
+def kv_cache_geometry(model_config: Any) -> tuple[int, int, int]:
+    """Return `(layers, heads, head_dim)` needed for KV-cache estimates."""
+
+    num_layers = int(_require_attr(model_config, "num_hidden_layers"))
+    num_heads = int(
+        getattr(model_config, "num_key_value_heads", None)
+        or _require_attr(model_config, "num_attention_heads")
+    )
+    head_dim = getattr(model_config, "head_dim", None)
+    if head_dim is None:
+        hidden_size = int(_require_attr(model_config, "hidden_size"))
+        attention_heads = int(_require_attr(model_config, "num_attention_heads"))
+        head_dim = hidden_size // attention_heads
+    return num_layers, num_heads, int(head_dim)
+
+
+def estimate_kv_cache_token_bytes(
+    num_layers: int,
+    num_heads: int,
+    head_dim: int,
+    dtype_bytes: int = 2,
+) -> int:
+    """Estimate KV bytes consumed by one token for one active sequence."""
+
+    return num_layers * num_heads * head_dim * 2 * dtype_bytes
+
+
+def estimate_kv_cache_sequence_bytes(
+    sequence_tokens: int,
+    num_layers: int,
+    num_heads: int,
+    head_dim: int,
+    dtype_bytes: int = 2,
+) -> int:
+    """Estimate KV bytes for one sequence with a given cached token length."""
+
+    return max(0, int(sequence_tokens)) * estimate_kv_cache_token_bytes(
+        num_layers=num_layers,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        dtype_bytes=dtype_bytes,
+    )
+
+
 def estimate_kv_cache_bytes(
     batch_size: int,
     group_size: int,
@@ -34,12 +84,13 @@ def estimate_kv_cache_bytes(
     return (
         batch_size
         * group_size
-        * max_new_tokens
-        * num_layers
-        * num_heads
-        * head_dim
-        * 2
-        * dtype_bytes
+        * estimate_kv_cache_sequence_bytes(
+            sequence_tokens=max_new_tokens,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype_bytes=dtype_bytes,
+        )
     )
 
 
@@ -87,16 +138,7 @@ def compute_safe_chunk_size(config: Any, model_config: Any) -> int:
     group_size = int(config.group_size)
     max_new_tokens = int(config.max_new_tokens)
 
-    num_layers = _require_attr(model_config, "num_hidden_layers")
-    num_heads = getattr(model_config, "num_key_value_heads", None)
-    if num_heads is None:
-        num_heads = _require_attr(model_config, "num_attention_heads")
-
-    head_dim = getattr(model_config, "head_dim", None)
-    if head_dim is None:
-        hidden_size = _require_attr(model_config, "hidden_size")
-        attention_heads = _require_attr(model_config, "num_attention_heads")
-        head_dim = hidden_size // attention_heads
+    num_layers, num_heads, head_dim = kv_cache_geometry(model_config)
 
     budget = available_vram_bytes()
     if budget <= 0:

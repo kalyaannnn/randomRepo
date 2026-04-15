@@ -537,6 +537,8 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         prefill_tokens = float(self._runtime_stats["prefill_tokens"])
         decode_tokens = float(self._runtime_stats["decode_tokens"])
         cache_reuse_tokens = float(self._runtime_stats["cache_reuse_tokens"])
+        scheduler_prefill_passes = float(self._runtime_stats["scheduler_prefill_passes"])
+        scheduler_decode_passes = float(self._runtime_stats["scheduler_decode_passes"])
 
         return {
             "prompts": grouped_prompts,
@@ -571,6 +573,30 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "padding_ratio": (
                 total_padding_waste / total_padding_total
             ) if total_padding_total > 0 else 0.0,
+            "scheduler_prefill_token_budget": float(self._runtime_stats["scheduler_prefill_token_budget"]),
+            "scheduler_decode_token_budget": float(self._runtime_stats["scheduler_decode_token_budget"]),
+            "scheduler_prefill_passes": scheduler_prefill_passes,
+            "scheduler_decode_passes": scheduler_decode_passes,
+            "scheduler_prefill_admitted_sequences": float(
+                self._runtime_stats["scheduler_prefill_admitted_sequences"]
+            ),
+            "scheduler_decode_admitted_sequences": float(
+                self._runtime_stats["scheduler_decode_admitted_sequences"]
+            ),
+            "scheduler_prefill_kv_budget_mb": float(self._runtime_stats["scheduler_prefill_kv_budget_mb"]),
+            "scheduler_decode_kv_budget_mb": float(self._runtime_stats["scheduler_decode_kv_budget_mb"]),
+            "scheduler_prefill_admitted_kv_mb": float(self._runtime_stats["scheduler_prefill_admitted_kv_mb"]),
+            "scheduler_decode_admitted_kv_mb": float(self._runtime_stats["scheduler_decode_admitted_kv_mb"]),
+            "scheduler_prefill_kv_pressure": (
+                float(self._runtime_stats["scheduler_prefill_kv_pressure"]) / scheduler_prefill_passes
+            ) if scheduler_prefill_passes > 0 else 0.0,
+            "scheduler_decode_kv_pressure": (
+                float(self._runtime_stats["scheduler_decode_kv_pressure"]) / scheduler_decode_passes
+            ) if scheduler_decode_passes > 0 else 0.0,
+            "scheduler_deferred_sequences": float(self._runtime_stats["scheduler_deferred_sequences"]),
+            "scheduler_max_concurrent_sequences": float(
+                self._runtime_stats["scheduler_max_concurrent_sequences"]
+            ),
         }
 
     def _reset_runtime_stats(self) -> None:
@@ -586,6 +612,20 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "generation_padding_total_tokens": 0.0,
             "sequence_padding_waste_tokens": 0.0,
             "sequence_padding_total_tokens": 0.0,
+            "scheduler_prefill_token_budget": 0.0,
+            "scheduler_decode_token_budget": 0.0,
+            "scheduler_prefill_passes": 0.0,
+            "scheduler_decode_passes": 0.0,
+            "scheduler_prefill_admitted_sequences": 0.0,
+            "scheduler_decode_admitted_sequences": 0.0,
+            "scheduler_prefill_kv_budget_mb": 0.0,
+            "scheduler_decode_kv_budget_mb": 0.0,
+            "scheduler_prefill_admitted_kv_mb": 0.0,
+            "scheduler_decode_admitted_kv_mb": 0.0,
+            "scheduler_prefill_kv_pressure": 0.0,
+            "scheduler_decode_kv_pressure": 0.0,
+            "scheduler_deferred_sequences": 0.0,
+            "scheduler_max_concurrent_sequences": 0.0,
         }
 
     def _infer_device(self) -> torch.device:

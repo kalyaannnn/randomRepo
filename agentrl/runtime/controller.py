@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from agentrl.generation.scheduler import estimate_kv_cache_bytes
+from agentrl.generation.scheduler import dtype_bytes, estimate_kv_cache_bytes, kv_cache_geometry
 
 
 LOGGER = logging.getLogger(__name__)
@@ -80,6 +80,7 @@ class ExecutionController:
                 "runtime_low_headroom": 0.0,
                 "dominant_runtime_bottleneck": self._classify_bottleneck(metrics),
                 "runtime_recommendation": self._recommend_from_metrics(metrics),
+                "scheduler_kv_pressure": self._scheduler_kv_pressure(metrics),
             }
 
         bottleneck = self._classify_bottleneck(metrics)
@@ -97,6 +98,7 @@ class ExecutionController:
                 "runtime_low_headroom": 0.0,
                 "dominant_runtime_bottleneck": bottleneck,
                 "runtime_recommendation": recommendation,
+                "scheduler_kv_pressure": self._scheduler_kv_pressure(metrics),
                 **update,
             }
 
@@ -126,6 +128,7 @@ class ExecutionController:
             "active_prefill_chunk_size": float(self.config.prefill_chunk_size),
             "dominant_runtime_bottleneck": bottleneck,
             "runtime_recommendation": recommendation,
+            "scheduler_kv_pressure": self._scheduler_kv_pressure(metrics),
         }
 
     def handle_oom(self, stage: str) -> bool:
@@ -165,9 +168,12 @@ class ExecutionController:
         prefill_time_ms = float(metrics.get("prefill_time_ms", 0.0))
         decode_time_ms = float(metrics.get("decode_time_ms", 0.0))
         cache_reuse = float(metrics.get("cache_reuse_effectiveness", 0.0))
+        scheduler_pressure = self._scheduler_kv_pressure(metrics)
 
         if max(padding_ratio, generation_padding_ratio) >= 0.35:
             return "padding"
+        if scheduler_pressure >= 0.9:
+            return "kv_budget"
         if decode_time_ms > prefill_time_ms * 1.5:
             if cache_reuse < 0.3:
                 return "decode_without_cache_reuse"
@@ -178,6 +184,12 @@ class ExecutionController:
 
     def _recommend_from_metrics(self, metrics: dict[str, float]) -> str:
         bottleneck = self._classify_bottleneck(metrics)
+        scheduler_pressure = self._scheduler_kv_pressure(metrics)
+        if bottleneck == "kv_budget":
+            return (
+                "Scheduler is near its KV-cache budget; reduce chunk_size, max_new_tokens, "
+                "or prompt length before scaling up."
+            )
         if bottleneck == "padding":
             return "Padding waste is high; reduce chunk_size or group together similar prompt lengths."
         if bottleneck == "decode_without_cache_reuse":
@@ -223,18 +235,7 @@ class ExecutionController:
         }
 
     def _estimated_kv_cache_mb(self, model_config: Any) -> float:
-        num_layers = int(self._require_attr(model_config, "num_hidden_layers"))
-        num_heads = int(
-            getattr(model_config, "num_key_value_heads", None)
-            or self._require_attr(model_config, "num_attention_heads")
-        )
-        head_dim = getattr(model_config, "head_dim", None)
-        if head_dim is None:
-            hidden_size = int(self._require_attr(model_config, "hidden_size"))
-            attention_heads = int(self._require_attr(model_config, "num_attention_heads"))
-            head_dim = hidden_size // attention_heads
-
-        dtype_bytes = {"float16": 2, "bfloat16": 2, "float32": 4}.get(self.config.dtype, 2)
+        num_layers, num_heads, head_dim = kv_cache_geometry(model_config)
         chunk_size = int(self.config.chunk_size or self.config.group_size)
         estimate = estimate_kv_cache_bytes(
             batch_size=int(self.config.batch_size),
@@ -243,9 +244,14 @@ class ExecutionController:
             num_layers=num_layers,
             num_heads=num_heads,
             head_dim=int(head_dim),
-            dtype_bytes=dtype_bytes,
+            dtype_bytes=dtype_bytes(self.config.dtype),
         )
         return estimate / (1024 * 1024)
+
+    def _scheduler_kv_pressure(self, metrics: dict[str, float]) -> float:
+        prefill_pressure = float(metrics.get("scheduler_prefill_kv_pressure", 0.0))
+        decode_pressure = float(metrics.get("scheduler_decode_kv_pressure", 0.0))
+        return max(prefill_pressure, decode_pressure)
 
     def _risk_level(self, fraction: float | None) -> str:
         if fraction is None:
