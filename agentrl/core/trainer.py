@@ -212,6 +212,12 @@ class GRPOTrainer:
                 system_metrics["scheduler_decode_kv_pressure"] = float(
                     batch.metadata.get("scheduler_decode_kv_pressure", 0.0)
                 )
+                system_metrics["scheduler_length_sort_passes"] = float(
+                    batch.metadata.get("scheduler_length_sort_passes", 0.0)
+                )
+                system_metrics["scheduler_length_sorted_sequences"] = float(
+                    batch.metadata.get("scheduler_length_sorted_sequences", 0.0)
+                )
                 system_metrics["scheduler_deferred_sequences"] = float(
                     batch.metadata.get("scheduler_deferred_sequences", 0.0)
                 )

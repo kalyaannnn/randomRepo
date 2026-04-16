@@ -22,12 +22,14 @@ class ExecutionController:
     _adjustments: int = 0
     _last_reason: str = "none"
     _high_padding_streak: int = 0
+    _high_kv_pressure_streak: int = 0
 
     def __post_init__(self) -> None:
         self._oom_retries = 0
         self._adjustments = 0
         self._last_reason = "none"
         self._high_padding_streak = 0
+        self._high_kv_pressure_streak = 0
 
     def build_preflight_report(
         self,
@@ -92,7 +94,7 @@ class ExecutionController:
             )
         )
         if headroom >= self.config.min_runtime_headroom_mb:
-            update = self._maybe_reduce_for_padding(metrics)
+            update = self._maybe_reduce_proactively(metrics)
             return {
                 "runtime_adjustments": float(self._adjustments),
                 "runtime_low_headroom": 0.0,
@@ -199,6 +201,65 @@ class ExecutionController:
         if bottleneck == "prefill":
             return "Prefill dominates; trim prompts, lower max_prompt_tokens, or reduce prefill_chunk_size."
         return "Runtime phases look balanced for the current workload."
+
+    def _maybe_reduce_proactively(self, metrics: dict[str, float]) -> dict[str, float | str]:
+        """Tighten runtime knobs preemptively when pressure persists on CUDA runs."""
+
+        kv_update = self._maybe_reduce_for_kv_pressure(metrics)
+        if float(kv_update.get("runtime_adjustments", 0.0)) > 0.0:
+            return kv_update
+        padding_update = self._maybe_reduce_for_padding(metrics)
+        return {
+            **kv_update,
+            **padding_update,
+        }
+
+    def _maybe_reduce_for_kv_pressure(self, metrics: dict[str, float]) -> dict[str, float | str]:
+        """Reduce scheduler breadth when KV pressure remains near the configured budget."""
+
+        scheduler_pressure = self._scheduler_kv_pressure(metrics)
+        if scheduler_pressure >= 0.9:
+            self._high_kv_pressure_streak += 1
+        else:
+            self._high_kv_pressure_streak = 0
+
+        if self._high_kv_pressure_streak < 2:
+            return {
+                "kv_pressure_streak": float(self._high_kv_pressure_streak),
+            }
+
+        if self._reduce_chunk_size():
+            self._last_reason = "high_kv_pressure_chunk_size"
+            self._high_kv_pressure_streak = 0
+            LOGGER.warning(
+                "Scheduler KV pressure stayed high across steps. Reduced chunk_size to %s to lower admission cost.",
+                self.config.chunk_size,
+            )
+            return {
+                "kv_pressure_streak": 0.0,
+                "runtime_adjustments": float(self._adjustments),
+                "last_runtime_adjustment_reason": self._last_reason,
+                "active_chunk_size": float(self.config.chunk_size or self.config.group_size),
+            }
+
+        if self._reduce_prefill_chunk_size():
+            self._last_reason = "high_kv_pressure_prefill_chunk_size"
+            self._high_kv_pressure_streak = 0
+            LOGGER.warning(
+                "Scheduler KV pressure stayed high across steps. Reduced prefill_chunk_size to %s.",
+                self.config.prefill_chunk_size,
+            )
+            return {
+                "kv_pressure_streak": 0.0,
+                "runtime_adjustments": float(self._adjustments),
+                "last_runtime_adjustment_reason": self._last_reason,
+                "active_chunk_size": float(self.config.chunk_size or self.config.group_size),
+                "active_prefill_chunk_size": float(self.config.prefill_chunk_size),
+            }
+
+        return {
+            "kv_pressure_streak": float(self._high_kv_pressure_streak),
+        }
 
     def _maybe_reduce_for_padding(self, metrics: dict[str, float]) -> dict[str, float | str]:
         """Tighten chunking when padding waste remains high on CUDA runs."""

@@ -593,6 +593,8 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "scheduler_decode_kv_pressure": (
                 float(self._runtime_stats["scheduler_decode_kv_pressure"]) / scheduler_decode_passes
             ) if scheduler_decode_passes > 0 else 0.0,
+            "scheduler_length_sort_passes": float(self._runtime_stats["scheduler_length_sort_passes"]),
+            "scheduler_length_sorted_sequences": float(self._runtime_stats["scheduler_length_sorted_sequences"]),
             "scheduler_deferred_sequences": float(self._runtime_stats["scheduler_deferred_sequences"]),
             "scheduler_max_concurrent_sequences": float(
                 self._runtime_stats["scheduler_max_concurrent_sequences"]
@@ -624,6 +626,8 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "scheduler_decode_admitted_kv_mb": 0.0,
             "scheduler_prefill_kv_pressure": 0.0,
             "scheduler_decode_kv_pressure": 0.0,
+            "scheduler_length_sort_passes": 0.0,
+            "scheduler_length_sorted_sequences": 0.0,
             "scheduler_deferred_sequences": 0.0,
             "scheduler_max_concurrent_sequences": 0.0,
         }

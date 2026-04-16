@@ -97,11 +97,17 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 self._render_generation_prompt(states[index].observations, states[index].actions)
                 for index in active_indices
             ]
-            responses, padding_ratio = self._generate_active_batch(prompts)
+            ordered_indices, ordered_prompts = self._order_active_prompts_by_length(active_indices, prompts)
+            responses, padding_ratio = self._generate_active_batch(ordered_prompts)
+            responses_by_index = {
+                state_index: response_text
+                for state_index, response_text in zip(ordered_indices, responses, strict=True)
+            }
             padding_ratios.append(padding_ratio)
             self._track_padding_ratio(padding_ratio)
 
-            for state_index, response_text in zip(active_indices, responses, strict=True):
+            for state_index in active_indices:
+                response_text = responses_by_index[state_index]
                 state = states[state_index]
                 state.actions.append(response_text)
                 next_observation, done = state.env.step(response_text)
@@ -340,6 +346,25 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         ]
         padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
         return decoded, padding_ratio
+
+    def _order_active_prompts_by_length(
+        self,
+        active_indices: list[int],
+        prompts: list[str],
+    ) -> tuple[list[int], list[str]]:
+        """Order active prompts by estimated length while preserving response mapping."""
+
+        ordered_pairs = sorted(
+            zip(active_indices, prompts, strict=True),
+            key=lambda item: (len(item[1]), item[0]),
+        )
+        self._runtime_stats["scheduler_length_sorted_sequences"] += float(len(ordered_pairs))
+        if len(ordered_pairs) > 1:
+            self._runtime_stats["scheduler_length_sort_passes"] += 1.0
+        return (
+            [state_index for state_index, _prompt in ordered_pairs],
+            [prompt for _state_index, prompt in ordered_pairs],
+        )
 
     def _generate_active_batch_without_cache(
         self,
