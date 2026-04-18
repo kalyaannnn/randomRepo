@@ -288,8 +288,58 @@ def test_continuous_batching_collects_and_reports_padding_ratio() -> None:
     assert "scheduler_prefill_kv_budget_mb" in batch.metadata
     assert "scheduler_decode_kv_budget_mb" in batch.metadata
     assert "scheduler_decode_admitted_kv_mb" in batch.metadata
+    assert "scheduler_prefill_block_budget" in batch.metadata
+    assert "scheduler_decode_block_budget" in batch.metadata
+    assert "scheduler_prefill_admitted_blocks" in batch.metadata
+    assert "scheduler_decode_admitted_blocks" in batch.metadata
+    assert "scheduler_length_sort_passes" in batch.metadata
+    assert "scheduler_length_sorted_sequences" in batch.metadata
+    assert "paged_kv_block_size_tokens" in batch.metadata
+    assert "paged_kv_free_block_count" in batch.metadata
+    assert "paged_kv_used_block_count" in batch.metadata
+    assert "paged_kv_allocator_occupancy" in batch.metadata
+    assert "paged_kv_block_reuse_count" in batch.metadata
+    assert "paged_kv_allocator_pressure" in batch.metadata
+    assert "paged_kv_max_blocks_in_use" in batch.metadata
+    assert "paged_kv_resident_sequences" in batch.metadata
+    assert "paged_kv_preempted_sequences" in batch.metadata
+    assert "paged_kv_max_preempted_sequences" in batch.metadata
     assert batch.metadata["scheduler_prefill_kv_budget_mb"] > 0.0
     assert batch.metadata["scheduler_decode_kv_budget_mb"] > 0.0
+    assert batch.metadata["scheduler_prefill_block_budget"] == 0.0
+    assert batch.metadata["scheduler_decode_block_budget"] == 0.0
+    assert batch.metadata["scheduler_prefill_admitted_blocks"] == 0.0
+    assert batch.metadata["scheduler_decode_admitted_blocks"] == 0.0
+    assert batch.metadata["paged_kv_block_size_tokens"] == 0.0
+    assert batch.metadata["paged_kv_free_block_count"] == 0.0
+    assert batch.metadata["paged_kv_max_blocks_in_use"] == 0.0
+
+
+def test_paged_kv_continuous_collects_block_metrics() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=4,
+        use_paged_kv_continuous=True,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=Layout(),
+        device=torch.device("cpu"),
+    )
+
+    batch = orchestrator.collect()
+
+    assert batch.rewards.tolist() == [[1.0, 1.0]]
+    assert batch.metadata["scheduler_prefill_block_budget"] > 0.0
+    assert batch.metadata["scheduler_decode_block_budget"] > 0.0
+    assert batch.metadata["paged_kv_block_size_tokens"] == 16.0
+    assert batch.metadata["paged_kv_free_block_count"] >= 0.0
+    assert batch.metadata["paged_kv_max_blocks_in_use"] >= 1.0
 
 
 def test_continuous_batching_uses_chunked_prefill_for_long_prompts() -> None:
@@ -333,6 +383,7 @@ def test_continuous_scheduler_defers_sequences_under_safe_policy() -> None:
         prefill_chunk_size=32,
         execution_policy="safe",
         do_sample=False,
+        use_paged_kv_continuous=True,
     )
     orchestrator = ContinuousBatchingOrchestrator(
         config=config,
@@ -351,6 +402,89 @@ def test_continuous_scheduler_defers_sequences_under_safe_policy() -> None:
     assert orchestrator._runtime_stats["scheduler_decode_passes"] >= 2.0
     assert orchestrator._runtime_stats["scheduler_deferred_sequences"] > 0.0
     assert orchestrator._runtime_stats["scheduler_max_concurrent_sequences"] < 4.0
+    assert orchestrator._runtime_stats["paged_kv_preempted_sequences"] > 0.0
+    assert orchestrator._runtime_stats["paged_kv_max_preempted_sequences"] > 0.0
+
+
+def test_scheduler_costing_is_mode_aware() -> None:
+    legacy_config = GRPOConfig(model_name="fake/model")
+    paged_config = GRPOConfig(model_name="fake/model", use_paged_kv_continuous=True)
+    legacy = ContinuousBatchingOrchestrator(
+        config=legacy_config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=Layout(),
+        device=torch.device("cpu"),
+    )
+    paged = ContinuousBatchingOrchestrator(
+        config=paged_config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=Layout(),
+        device=torch.device("cpu"),
+    )
+
+    scheduler = legacy._build_scheduler_state(active_count=2)
+
+    assert legacy._estimate_sequence_kv_cost(17, scheduler) == 17 * int(scheduler.kv_bytes_per_token or 1)
+    assert paged._estimate_sequence_kv_cost(17, scheduler) == 2 * int(scheduler.kv_bytes_per_block or 1)
+
+
+def test_continuous_scheduler_orders_active_prompts_by_length() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=1,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=Layout(),
+        device=torch.device("cpu"),
+    )
+
+    ordered_indices, ordered_prompts = orchestrator._order_active_prompts_by_length(
+        active_indices=[4, 1, 3, 2],
+        prompts=["xxxx", "y", "zzz", "qq"],
+    )
+
+    assert ordered_indices == [1, 2, 3, 4]
+    assert ordered_prompts == ["y", "qq", "zzz", "xxxx"]
+
+
+def test_continuous_scheduler_reports_length_sort_metadata() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=1,
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=ConstantLayout(),
+        device=torch.device("cpu"),
+    )
+
+    ordered_indices, ordered_prompts = orchestrator._order_active_prompts_by_length(
+        active_indices=[0, 1, 2],
+        prompts=["xxxx", "y", "zzz"],
+    )
+
+    responses, _padding_ratio = orchestrator._generate_active_batch(ordered_prompts)
+
+    assert ordered_indices == [1, 2, 0]
+    assert responses == ["a", "a", "a"]
+    assert orchestrator._runtime_stats["scheduler_length_sort_passes"] == 1.0
+    assert orchestrator._runtime_stats["scheduler_length_sorted_sequences"] == 3.0
 
 
 @pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")

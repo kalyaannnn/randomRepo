@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,20 @@ from examples.gsm8k_subset import (
     GSM8KSubsetVerifier,
 )
 from examples.math_env import MathEnvironment, MathProblem, MathVerifier
+
+
+def test_readme_mentions_official_byod_api() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    links = re.findall(r"\[[^\]]+\]\(([^)]+)\)", readme)
+    repo_root = Path.cwd()
+
+    assert "BYODRecord" in readme
+    assert "make_single_turn_task" in readme
+    assert (repo_root / "notebooks/gsm8k_end_to_end.ipynb").is_file()
+    assert (repo_root / "notebooks/byod_onboarding.ipynb").is_file()
+    assert str(repo_root / "docs/bring_your_own_task.md") in links
+    assert str(repo_root / "notebooks/gsm8k_end_to_end.ipynb") in links
+    assert str(repo_root / "notebooks/byod_onboarding.ipynb") in links
 
 
 def test_math_environment_and_verifier_roundtrip() -> None:
@@ -512,12 +527,91 @@ def test_benchmark_systems_writes_summary(monkeypatch, tmp_path) -> None:
 
     summary = (tmp_path / "systems" / "summary.json").read_text(encoding="utf-8")
     assert '"mean_step_time_ms": 100.0' in summary
+    assert '"mode_name": "continuous batching"' in summary
     assert '"mean_generation_fraction": 0.6' in summary
     assert '"mean_cache_reuse_effectiveness": 0.7' in summary
     assert '"dominant_runtime_bottleneck": "padding"' in summary
     assert '"efficiency_diagnosis": "padding-limited"' in summary
     assert '"steps_with_runtime_adjustment": 1' in summary
     assert '"benchmark_verdict": "continuous batching was padding-limited, dominated by padding, and needed 1 runtime adjustment.' in summary
+
+
+def test_benchmark_systems_reports_paged_kv_diagnosis(monkeypatch, tmp_path) -> None:
+    class StubTrainer:
+        def __init__(self, config, environment, verifier):
+            del environment, verifier
+            self.config = config
+
+        def train(self):
+            assert self.config.use_paged_kv_continuous is True
+            return [
+                {
+                    "total_step_time_ms": 90.0,
+                    "generation_time_ms": 40.0,
+                    "training_time_ms": 50.0,
+                    "tokens_per_second": 24.0,
+                    "prefill_tokens_per_second": 18.0,
+                    "decode_tokens_per_second": 16.0,
+                    "padding_ratio": 0.1,
+                    "generation_padding_ratio": 0.1,
+                    "sequence_padding_ratio": 0.05,
+                    "cache_reuse_effectiveness": 0.85,
+                    "scheduler_prefill_kv_pressure": 0.2,
+                    "scheduler_decode_kv_pressure": 0.3,
+                    "paged_kv_allocator_pressure": 0.95,
+                    "peak_vram_mb": 125.0,
+                    "rollout_peak_vram_mb": 115.0,
+                    "rollout_runtime_headroom_mb": 450.0,
+                    "runtime_adjustments": 0.0,
+                    "runtime_low_headroom": 0.0,
+                    "dominant_runtime_bottleneck": "paged_kv",
+                    "runtime_recommendation": "Paged-KV allocator pressure is high and live sequences are being deferred; reduce chunk_size, max_new_tokens, or prompt length before scaling concurrency.",
+                    "last_runtime_adjustment_reason": "none",
+                }
+            ]
+
+    monkeypatch.setattr(benchmark_systems, "GRPOTrainer", StubTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_systems.py",
+            "--model",
+            "fake/model",
+            "--steps",
+            "1",
+            "--batch-size",
+            "1",
+            "--group-size",
+            "4",
+            "--max-new-tokens",
+            "16",
+            "--split",
+            "easy",
+            "--output-dir",
+            str(tmp_path / "systems_paged"),
+        ],
+    )
+
+    original_run_one = benchmark_systems._run_one
+
+    def stubbed_run_one(args, use_continuous_batching, output_dir, *, use_paged_kv_continuous=False):
+        return original_run_one(
+            args,
+            use_continuous_batching=use_continuous_batching,
+            output_dir=output_dir,
+            use_paged_kv_continuous=True,
+        )
+
+    monkeypatch.setattr(benchmark_systems, "_run_one", stubbed_run_one)
+
+    benchmark_systems_main()
+
+    summary = (tmp_path / "systems_paged" / "summary.json").read_text(encoding="utf-8")
+    assert '"mode_name": "paged-kv continuous batching"' in summary
+    assert '"mean_scheduler_kv_pressure": 0.95' in summary
+    assert '"dominant_runtime_bottleneck": "paged_kv"' in summary
+    assert '"efficiency_diagnosis": "paged-kv-limited"' in summary
 
 
 def test_benchmark_systems_writes_comparison_verdict(monkeypatch, tmp_path) -> None:
@@ -530,6 +624,30 @@ def test_benchmark_systems_writes_comparison_verdict(monkeypatch, tmp_path) -> N
 
         def train(self):
             call_count["value"] += 1
+            if self.config.use_paged_kv_continuous:
+                return [
+                    {
+                        "total_step_time_ms": 70.0,
+                        "generation_time_ms": 42.0,
+                        "training_time_ms": 28.0,
+                        "tokens_per_second": 35.0,
+                        "prefill_tokens_per_second": 27.0,
+                        "decode_tokens_per_second": 22.0,
+                        "padding_ratio": 0.15,
+                        "generation_padding_ratio": 0.15,
+                        "sequence_padding_ratio": 0.08,
+                        "cache_reuse_effectiveness": 0.9,
+                        "paged_kv_allocator_pressure": 0.9,
+                        "peak_vram_mb": 119.0,
+                        "rollout_peak_vram_mb": 109.0,
+                        "rollout_runtime_headroom_mb": 510.0,
+                        "runtime_adjustments": 0.0,
+                        "runtime_low_headroom": 0.0,
+                        "dominant_runtime_bottleneck": "paged_kv",
+                        "runtime_recommendation": "Paged-KV allocator pressure is high and live sequences are being deferred; reduce chunk_size, max_new_tokens, or prompt length before scaling concurrency.",
+                        "last_runtime_adjustment_reason": "none",
+                    }
+                ]
             if self.config.use_continuous_batching:
                 return [
                     {
@@ -596,14 +714,17 @@ def test_benchmark_systems_writes_comparison_verdict(monkeypatch, tmp_path) -> N
             "easy",
             "--output-dir",
             str(tmp_path / "systems_compare"),
-            "--compare-standard-vs-continuous",
+            "--compare-runtime-modes",
         ],
     )
 
     benchmark_systems_main()
 
     comparison = (tmp_path / "systems_compare" / "comparison.json").read_text(encoding="utf-8")
-    assert '"comparison_verdict": "continuous batching was faster on mean step time than standard rollout (80.00 ms vs 100.00 ms) but was padding-limited. It needed 1 runtime adjustment."' in comparison
+    assert '"mode_name": "standard rollout"' in comparison
+    assert '"mode_name": "continuous batching"' in comparison
+    assert '"mode_name": "paged-kv continuous batching"' in comparison
+    assert '"comparison_verdict": "Fastest overall: paged-kv continuous batching (70.00 ms mean step time, paged-kv-limited). Slowest overall: standard rollout (100.00 ms). Paged-KV continuous batching was 10.00 ms faster than legacy continuous batching (70.00 ms vs 80.00 ms)."' in comparison
 
 
 def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:

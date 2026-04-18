@@ -12,6 +12,7 @@ from torch import nn
 
 from agentrl.core.base import BaseEnvironment
 from agentrl.core.rollout import RolloutBatch, RolloutOrchestrator
+from agentrl.generation.paged_kv import PagedKVAllocator, PagedKVCacheStore
 from agentrl.generation.scheduler import (
     dtype_bytes,
     estimate_kv_cache_sequence_bytes,
@@ -60,10 +61,14 @@ class _ContinuousSchedulerState:
     prefill_cost_budget: int
     decode_cost_budget: int
     kv_bytes_per_token: int | None = None
+    block_size_tokens: int = 1
+    kv_bytes_per_block: int | None = None
 
 
 class ContinuousBatchingOrchestrator(RolloutOrchestrator):
     """Rollout orchestrator that drops finished sequences during decoding."""
+
+    PAGED_KV_BLOCK_SIZE_TOKENS = 16
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -227,18 +232,27 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         self._runtime_stats["scheduler_decode_token_budget"] += float(scheduler.decode_token_budget)
         self._runtime_stats["scheduler_prefill_kv_budget_mb"] += self._bytes_to_mb(scheduler.prefill_cost_budget)
         self._runtime_stats["scheduler_decode_kv_budget_mb"] += self._bytes_to_mb(scheduler.decode_cost_budget)
+        if self.config.use_paged_kv_continuous:
+            self._runtime_stats["scheduler_prefill_block_budget"] += float(
+                max(1, scheduler.prefill_token_budget // scheduler.block_size_tokens)
+            )
+            self._runtime_stats["scheduler_decode_block_budget"] += float(
+                max(1, scheduler.decode_token_budget // scheduler.block_size_tokens)
+            )
 
         generation_model = self.layout.model
         if self._supports_persistent_kv_decode(generation_model):
+            if not self.config.use_paged_kv_continuous:
+                return self._generate_active_batch_with_legacy_cache(scheduled_sequences, scheduler)
             return self._generate_active_batch_with_cache(scheduled_sequences, scheduler)
         return self._generate_active_batch_without_cache(scheduled_sequences, scheduler)
 
-    def _generate_active_batch_with_cache(
+    def _generate_active_batch_with_legacy_cache(
         self,
         scheduled_sequences: list[_ScheduledSequence],
         scheduler: _ContinuousSchedulerState,
     ) -> tuple[list[str], float]:
-        """Generate with persistent per-sequence KV caches across active decoding."""
+        """Legacy persistent-KV continuous batching baseline."""
 
         generation_model = self.layout.model
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
@@ -347,6 +361,150 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
         return decoded, padding_ratio
 
+    def _generate_active_batch_with_cache(
+        self,
+        scheduled_sequences: list[_ScheduledSequence],
+        scheduler: _ContinuousSchedulerState,
+    ) -> tuple[list[str], float]:
+        """Generate with persistent per-sequence KV caches across active decoding."""
+
+        generation_model = self.layout.model
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        generated_ids = [
+            torch.empty(0, dtype=torch.long, device=self.device)
+            for _ in scheduled_sequences
+        ]
+        finished = [False for _ in scheduled_sequences]
+        generated_steps = [0 for _ in scheduled_sequences]
+        sequence_lengths = [sequence.prompt_tokens for sequence in scheduled_sequences]
+        next_logits_by_index: dict[int, torch.Tensor] = {}
+        paged_kv = self._build_paged_kv_allocator(scheduler, sequence_lengths)
+        self._runtime_stats["prefill_tokens"] += float(sum(sequence_lengths))
+        self._update_paged_kv_runtime_stats(paged_kv)
+
+        prefill_start = time.perf_counter()
+        for batch in self._iter_scheduled_prefill_batches(scheduled_sequences, scheduler):
+            prompt_ids = [sequence.prompt_ids for sequence in batch]
+            prompt_masks = [sequence.prompt_mask for sequence in batch]
+            batch_caches, batch_logits = self._prefill_prompt_caches(generation_model, prompt_ids, prompt_masks)
+            for offset, sequence in enumerate(batch):
+                paged_kv.write_sequence_cache(
+                    sequence.original_index,
+                    self._cache_to_legacy(batch_caches[offset]),
+                    batch_caches[offset],
+                )
+                next_logits_by_index[sequence.original_index] = batch_logits[offset : offset + 1]
+        self._runtime_stats["prefill_time_ms"] += (time.perf_counter() - prefill_start) * 1000.0
+
+        total_padding_tokens = 0
+        total_step_tokens = 0
+        decode_start = time.perf_counter()
+        while True:
+            active_indices = [
+                index
+                for index, is_finished in enumerate(finished)
+                if not is_finished and generated_steps[index] < self.config.max_new_tokens
+            ]
+            if not active_indices:
+                break
+
+            admitted_indices = self._select_admitted_indices(
+                candidate_indices=active_indices,
+                estimated_tokens={index: sequence_lengths[index] for index in active_indices},
+                estimated_costs={
+                    index: self._estimate_sequence_kv_cost(sequence_lengths[index], scheduler)
+                    for index in active_indices
+                },
+                cost_budget=scheduler.decode_cost_budget,
+                max_batch_size=scheduler.max_batch_size,
+                phase="decode",
+                scheduler=scheduler,
+            )
+            admitted_indices = self._apply_paged_kv_growth_admission(
+                allocator=paged_kv,
+                candidate_indices=admitted_indices,
+                sequence_lengths=sequence_lengths,
+                scheduler=scheduler,
+            )
+            self._update_paged_kv_preemption_runtime_stats(
+                allocator=paged_kv,
+                active_indices=active_indices,
+                admitted_indices=admitted_indices,
+            )
+            active_logits = torch.cat([next_logits_by_index[index] for index in admitted_indices], dim=0)
+            next_tokens = self._sample_next_token(active_logits)
+
+            decode_buckets: dict[int, list[tuple[int, torch.Tensor]]] = {}
+            for batch_offset, episode_index in enumerate(admitted_indices):
+                token_tensor = next_tokens[batch_offset : batch_offset + 1].to(dtype=torch.long, device=self.device)
+                generated_ids[episode_index] = torch.cat((generated_ids[episode_index], token_tensor), dim=0)
+                self._runtime_stats["decode_tokens"] += float(token_tensor.numel())
+                generated_steps[episode_index] += 1
+                paged_kv.append_tokens(episode_index, int(token_tensor.numel()))
+                token = int(token_tensor.item())
+                if eos_token_id is not None and token == eos_token_id:
+                    finished[episode_index] = True
+                    paged_kv.release(episode_index)
+                    continue
+                decode_buckets.setdefault(sequence_lengths[episode_index], []).append((episode_index, token_tensor))
+            self._update_paged_kv_runtime_stats(paged_kv)
+
+            if not decode_buckets:
+                break
+
+            deferred_logits = {
+                index: next_logits_by_index[index]
+                for index in active_indices
+                if index not in admitted_indices
+            }
+            next_logits_by_index = deferred_logits
+            for sequence_length, bucket in decode_buckets.items():
+                total_step_tokens += sequence_length * len(bucket)
+                self._runtime_stats["cache_reuse_tokens"] += float(sequence_length * len(bucket))
+
+                bucket_indices = [episode_index for episode_index, _token_tensor in bucket]
+                bucket_tokens = torch.stack([token_tensor for _episode_index, token_tensor in bucket], dim=0)
+                bucket_attention = torch.ones(
+                    (len(bucket), sequence_length + 1),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                bucket_cache_legacy = paged_kv.read_batched_legacy_cache(bucket_indices)
+                bucket_cache = self._cache_from_legacy(
+                    paged_kv.cache_template(bucket_indices[0]),
+                    bucket_cache_legacy,
+                )
+                outputs = generation_model(
+                    input_ids=bucket_tokens,
+                    attention_mask=bucket_attention,
+                    past_key_values=bucket_cache,
+                    use_cache=True,
+                )
+                bucket_logits = outputs.logits[:, -1, :]
+                paged_kv.write_batched_legacy_cache(
+                    bucket_indices,
+                    self._cache_to_legacy(outputs.past_key_values),
+                    outputs.past_key_values,
+                )
+
+                for offset, episode_index in enumerate(bucket_indices):
+                    sequence_lengths[episode_index] += 1
+                    next_logits_by_index[episode_index] = bucket_logits[offset : offset + 1]
+        self._runtime_stats["decode_time_ms"] += (time.perf_counter() - decode_start) * 1000.0
+        self._runtime_stats["generation_padding_waste_tokens"] += float(total_padding_tokens)
+        self._runtime_stats["generation_padding_total_tokens"] += float(total_step_tokens)
+        for episode_index, is_finished in enumerate(finished):
+            if not is_finished:
+                paged_kv.release(episode_index)
+        self._update_paged_kv_runtime_stats(paged_kv)
+
+        decoded = [
+            self._postprocess_response(self.tokenizer.decode(tokens, skip_special_tokens=True))
+            for tokens in generated_ids
+        ]
+        padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
+        return decoded, padding_ratio
+
     def _order_active_prompts_by_length(
         self,
         active_indices: list[int],
@@ -382,7 +540,15 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         ]
         finished = [False for _ in scheduled_sequences]
         generated_steps = [0 for _ in scheduled_sequences]
+        sequence_lengths = [int(mask.sum().item()) for mask in prompt_masks]
+        paged_kv = (
+            self._build_paged_kv_allocator(scheduler, sequence_lengths)
+            if self.config.use_paged_kv_continuous
+            else None
+        )
         self._runtime_stats["prefill_tokens"] += float(sum(int(mask.sum().item()) for mask in prompt_masks))
+        if paged_kv is not None:
+            self._update_paged_kv_runtime_stats(paged_kv)
 
         total_padding_tokens = 0
         total_step_tokens = 0
@@ -401,8 +567,15 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             self._runtime_stats["decode_tokens"] += float(initial_decode_tokens)
             for index, tokens in enumerate(generated_ids):
                 generated_steps[index] = int(tokens.numel())
+                if paged_kv is not None and generated_steps[index] > 0:
+                    paged_kv.append_tokens(index, generated_steps[index])
+                sequence_lengths[index] += generated_steps[index]
                 if finished[index]:
+                    if paged_kv is not None:
+                        paged_kv.release(index)
                     continue
+            if paged_kv is not None:
+                self._update_paged_kv_runtime_stats(paged_kv)
 
         decode_start = time.perf_counter()
         while True:
@@ -426,6 +599,12 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 phase="decode",
                 scheduler=scheduler,
             )
+            if paged_kv is not None:
+                self._update_paged_kv_preemption_runtime_stats(
+                    allocator=paged_kv,
+                    active_indices=active_indices,
+                    admitted_indices=admitted_indices,
+                )
             active_sequences = [current_ids[index] for index in admitted_indices]
             max_length = max(sequence.numel() for sequence in active_sequences)
             total_step_tokens += max_length * len(active_sequences)
@@ -438,12 +617,24 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 generated_ids[episode_index] = torch.cat((generated_ids[episode_index], token_tensor), dim=0)
                 current_ids[episode_index] = torch.cat((current_ids[episode_index], token_tensor), dim=0)
                 generated_steps[episode_index] += 1
+                sequence_lengths[episode_index] += 1
+                if paged_kv is not None:
+                    paged_kv.append_tokens(episode_index, 1)
                 self._runtime_stats["decode_tokens"] += 1.0
                 if token == getattr(self.tokenizer, "eos_token_id", None):
                     finished[episode_index] = True
+                    if paged_kv is not None:
+                        paged_kv.release(episode_index)
+            if paged_kv is not None:
+                self._update_paged_kv_runtime_stats(paged_kv)
         self._runtime_stats["decode_time_ms"] += (time.perf_counter() - decode_start) * 1000.0
         self._runtime_stats["generation_padding_waste_tokens"] += float(total_padding_tokens)
         self._runtime_stats["generation_padding_total_tokens"] += float(total_step_tokens)
+        if paged_kv is not None:
+            for episode_index, is_finished in enumerate(finished):
+                if not is_finished:
+                    paged_kv.release(episode_index)
+            self._update_paged_kv_runtime_stats(paged_kv)
 
         decoded = [self._postprocess_response(self.tokenizer.decode(tokens, skip_special_tokens=True)) for tokens in generated_ids]
         padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
@@ -469,6 +660,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         )
         model_config = getattr(self.layout.model, "config", None)
         kv_bytes = None
+        block_size = self.PAGED_KV_BLOCK_SIZE_TOKENS
         if model_config is not None:
             try:
                 num_layers, num_heads, head_dim = kv_cache_geometry(model_config)
@@ -492,6 +684,8 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 decode_budget * kv_bytes if kv_bytes is not None else decode_budget
             ),
             kv_bytes_per_token=kv_bytes,
+            block_size_tokens=block_size,
+            kv_bytes_per_block=(kv_bytes * block_size) if kv_bytes is not None else None,
         )
 
     def _iter_scheduled_prefill_batches(
@@ -577,6 +771,14 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             float(self._runtime_stats["scheduler_max_concurrent_sequences"]),
             float(len(admitted)),
         )
+        if self.config.use_paged_kv_continuous:
+            admitted_blocks = float(
+                sum(self._estimate_sequence_block_count(estimated_tokens[index], scheduler) for index in admitted)
+            )
+            if phase == "prefill":
+                self._runtime_stats["scheduler_prefill_admitted_blocks"] += admitted_blocks
+            else:
+                self._runtime_stats["scheduler_decode_admitted_blocks"] += admitted_blocks
         admitted_cost_mb = self._bytes_to_mb(used_cost) if scheduler.kv_bytes_per_token is not None else 0.0
         budget_cost_mb = self._bytes_to_mb(cost_budget) if scheduler.kv_bytes_per_token is not None else 0.0
         self._runtime_stats[f"scheduler_{phase}_admitted_kv_mb"] += admitted_cost_mb
@@ -592,9 +794,142 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
     ) -> int:
         """Estimate scheduler admission cost for one sequence."""
 
+        token_count = max(1, int(sequence_tokens))
+        if not self.config.use_paged_kv_continuous:
+            if scheduler.kv_bytes_per_token is None:
+                return token_count
+            return token_count * scheduler.kv_bytes_per_token
+
+        block_count = self._estimate_sequence_block_count(token_count, scheduler)
         if scheduler.kv_bytes_per_token is None:
-            return max(1, int(sequence_tokens))
-        return max(1, int(sequence_tokens)) * scheduler.kv_bytes_per_token
+            return max(1, block_count * scheduler.block_size_tokens)
+        return block_count * max(1, int(scheduler.kv_bytes_per_block or 0))
+
+    def _estimate_sequence_block_count(
+        self,
+        sequence_tokens: int,
+        scheduler: _ContinuousSchedulerState,
+    ) -> int:
+        tokens = max(1, int(sequence_tokens))
+        return (tokens + scheduler.block_size_tokens - 1) // scheduler.block_size_tokens
+
+    def _build_paged_kv_allocator(
+        self,
+        scheduler: _ContinuousSchedulerState,
+        sequence_lengths: list[int],
+    ) -> PagedKVCacheStore:
+        """Build a fixed-block allocator for runtime accounting.
+
+        The current branch uses the allocator to track paged-KV occupancy and
+        reuse semantics before the full block-backed decode path replaces the
+        existing cache-object implementation.
+        """
+
+        block_size_tokens = 16
+        prompt_block_total = sum(
+            (sequence_tokens + block_size_tokens - 1) // block_size_tokens
+            for sequence_tokens in sequence_lengths
+        )
+        decode_block_headroom = len(sequence_lengths) * (
+            (self.config.max_new_tokens + block_size_tokens - 1) // block_size_tokens
+        )
+        max_tokens_budget = max(
+            scheduler.prefill_token_budget,
+            scheduler.decode_token_budget,
+            prompt_block_total * block_size_tokens + decode_block_headroom * block_size_tokens,
+        )
+        total_blocks = max(
+            1,
+            int((max_tokens_budget + block_size_tokens - 1) // block_size_tokens),
+        )
+        allocator = PagedKVAllocator(
+            total_blocks=total_blocks,
+            block_size_tokens=block_size_tokens,
+        )
+        store = PagedKVCacheStore(allocator=allocator)
+        for episode_index, prompt_tokens in enumerate(sequence_lengths):
+            store.reserve(episode_index, prompt_tokens)
+        return store
+
+    def _update_paged_kv_runtime_stats(self, allocator: PagedKVCacheStore) -> None:
+        """Mirror allocator counters into rollout runtime stats."""
+
+        metrics = allocator.metrics()
+        self._runtime_stats["paged_kv_block_size_tokens"] = float(allocator.allocator.block_size_tokens)
+        self._runtime_stats["paged_kv_free_block_count"] = metrics["paged_kv_free_block_count"]
+        self._runtime_stats["paged_kv_used_block_count"] = metrics["paged_kv_used_block_count"]
+        self._runtime_stats["paged_kv_allocator_occupancy"] = metrics["paged_kv_allocator_occupancy"]
+        self._runtime_stats["paged_kv_block_reuse_count"] = metrics["paged_kv_block_reuse_count"]
+        self._runtime_stats["paged_kv_allocator_pressure"] = metrics["paged_kv_allocator_pressure"]
+        self._runtime_stats["paged_kv_max_blocks_in_use"] = max(
+            self._runtime_stats["paged_kv_max_blocks_in_use"],
+            metrics["paged_kv_max_blocks_in_use"],
+        )
+        self._runtime_stats["paged_kv_resident_sequences"] = metrics["paged_kv_resident_sequences"]
+
+    def _update_paged_kv_preemption_runtime_stats(
+        self,
+        allocator: PagedKVCacheStore,
+        active_indices: list[int],
+        admitted_indices: list[int],
+    ) -> None:
+        """Record scheduler-level soft preemption for resident sequences.
+
+        A sequence is considered preempted in this v1 design when it remains
+        live with resident KV blocks but is not admitted on the current decode
+        step.
+        """
+
+        admitted_set = set(admitted_indices)
+        resident_preempted = sum(
+            1
+            for index in active_indices
+            if index not in admitted_set and allocator.has_sequence(index)
+        )
+        self._runtime_stats["paged_kv_preempted_sequences"] += float(resident_preempted)
+        self._runtime_stats["paged_kv_max_preempted_sequences"] = max(
+            self._runtime_stats["paged_kv_max_preempted_sequences"],
+            float(resident_preempted),
+        )
+
+    def _apply_paged_kv_growth_admission(
+        self,
+        allocator: PagedKVCacheStore,
+        candidate_indices: list[int],
+        sequence_lengths: list[int],
+        scheduler: _ContinuousSchedulerState,
+    ) -> list[int]:
+        """Trim decode admission when next-token growth would exceed free blocks.
+
+        Any sequence whose next token would cross a block boundary requires one
+        extra free block. We keep the scheduler's fairness order, but cap the
+        admitted set so block growth remains feasible without eviction.
+        """
+
+        free_blocks = allocator.allocator.free_block_count
+        admitted: list[int] = []
+        growth_blocks_used = 0
+        for index in candidate_indices:
+            needs_growth_block = (
+                max(1, int(sequence_lengths[index])) % scheduler.block_size_tokens == 0
+            )
+            if needs_growth_block and growth_blocks_used >= free_blocks:
+                continue
+            admitted.append(index)
+            if needs_growth_block:
+                growth_blocks_used += 1
+
+        if not admitted and candidate_indices:
+            admitted = [candidate_indices[0]]
+        self._runtime_stats["scheduler_decode_growth_block_demand"] += float(
+            sum(
+                1
+                for index in candidate_indices
+                if max(1, int(sequence_lengths[index])) % scheduler.block_size_tokens == 0
+            )
+        )
+        self._runtime_stats["scheduler_decode_growth_blocks_admitted"] += float(growth_blocks_used)
+        return admitted
 
     def _bytes_to_mb(self, value: int) -> float:
         """Convert a byte estimate to megabytes for reporting."""

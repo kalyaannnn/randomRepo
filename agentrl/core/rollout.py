@@ -593,12 +593,32 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "scheduler_decode_kv_pressure": (
                 float(self._runtime_stats["scheduler_decode_kv_pressure"]) / scheduler_decode_passes
             ) if scheduler_decode_passes > 0 else 0.0,
+            "scheduler_prefill_block_budget": float(self._runtime_stats["scheduler_prefill_block_budget"]),
+            "scheduler_decode_block_budget": float(self._runtime_stats["scheduler_decode_block_budget"]),
+            "scheduler_prefill_admitted_blocks": float(self._runtime_stats["scheduler_prefill_admitted_blocks"]),
+            "scheduler_decode_admitted_blocks": float(self._runtime_stats["scheduler_decode_admitted_blocks"]),
+            "scheduler_decode_growth_block_demand": float(
+                self._runtime_stats["scheduler_decode_growth_block_demand"]
+            ),
+            "scheduler_decode_growth_blocks_admitted": float(
+                self._runtime_stats["scheduler_decode_growth_blocks_admitted"]
+            ),
             "scheduler_length_sort_passes": float(self._runtime_stats["scheduler_length_sort_passes"]),
             "scheduler_length_sorted_sequences": float(self._runtime_stats["scheduler_length_sorted_sequences"]),
             "scheduler_deferred_sequences": float(self._runtime_stats["scheduler_deferred_sequences"]),
             "scheduler_max_concurrent_sequences": float(
                 self._runtime_stats["scheduler_max_concurrent_sequences"]
             ),
+            "paged_kv_block_size_tokens": float(self._runtime_stats["paged_kv_block_size_tokens"]),
+            "paged_kv_free_block_count": float(self._runtime_stats["paged_kv_free_block_count"]),
+            "paged_kv_used_block_count": float(self._runtime_stats["paged_kv_used_block_count"]),
+            "paged_kv_allocator_occupancy": float(self._runtime_stats["paged_kv_allocator_occupancy"]),
+            "paged_kv_block_reuse_count": float(self._runtime_stats["paged_kv_block_reuse_count"]),
+            "paged_kv_allocator_pressure": float(self._runtime_stats["paged_kv_allocator_pressure"]),
+            "paged_kv_max_blocks_in_use": float(self._runtime_stats["paged_kv_max_blocks_in_use"]),
+            "paged_kv_resident_sequences": float(self._runtime_stats["paged_kv_resident_sequences"]),
+            "paged_kv_preempted_sequences": float(self._runtime_stats["paged_kv_preempted_sequences"]),
+            "paged_kv_max_preempted_sequences": float(self._runtime_stats["paged_kv_max_preempted_sequences"]),
         }
 
     def _reset_runtime_stats(self) -> None:
@@ -626,10 +646,26 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "scheduler_decode_admitted_kv_mb": 0.0,
             "scheduler_prefill_kv_pressure": 0.0,
             "scheduler_decode_kv_pressure": 0.0,
+            "scheduler_prefill_block_budget": 0.0,
+            "scheduler_decode_block_budget": 0.0,
+            "scheduler_prefill_admitted_blocks": 0.0,
+            "scheduler_decode_admitted_blocks": 0.0,
+            "scheduler_decode_growth_block_demand": 0.0,
+            "scheduler_decode_growth_blocks_admitted": 0.0,
             "scheduler_length_sort_passes": 0.0,
             "scheduler_length_sorted_sequences": 0.0,
             "scheduler_deferred_sequences": 0.0,
             "scheduler_max_concurrent_sequences": 0.0,
+            "paged_kv_block_size_tokens": 0.0,
+            "paged_kv_free_block_count": 0.0,
+            "paged_kv_used_block_count": 0.0,
+            "paged_kv_allocator_occupancy": 0.0,
+            "paged_kv_block_reuse_count": 0.0,
+            "paged_kv_allocator_pressure": 0.0,
+            "paged_kv_max_blocks_in_use": 0.0,
+            "paged_kv_resident_sequences": 0.0,
+            "paged_kv_preempted_sequences": 0.0,
+            "paged_kv_max_preempted_sequences": 0.0,
         }
 
     def _infer_device(self) -> torch.device:

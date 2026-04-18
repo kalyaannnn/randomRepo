@@ -39,9 +39,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to write the runtime summary.",
     )
     parser.add_argument(
+        "--compare-runtime-modes",
+        action="store_true",
+        help="Run standard, legacy continuous, and paged-KV continuous modes on the same workload.",
+    )
+    parser.add_argument(
         "--compare-standard-vs-continuous",
         action="store_true",
-        help="Run both rollout modes on the same workload and emit a comparison summary.",
+        help="Deprecated alias for --compare-runtime-modes.",
     )
     return parser
 
@@ -65,8 +70,17 @@ def _config_hash(config: GRPOConfig) -> str:
         "max_new_tokens": config.max_new_tokens,
         "split": getattr(config, "split", None),
         "use_continuous_batching": config.use_continuous_batching,
+        "use_paged_kv_continuous": config.use_paged_kv_continuous,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def _mode_name(config: GRPOConfig) -> str:
+    if not config.use_continuous_batching:
+        return "standard rollout"
+    if config.use_paged_kv_continuous:
+        return "paged-kv continuous batching"
+    return "continuous batching"
 
 
 def _summarize_run(history: list[dict[str, float]], config: GRPOConfig, split: str) -> dict[str, object]:
@@ -85,7 +99,7 @@ def _summarize_run(history: list[dict[str, float]], config: GRPOConfig, split: s
     top_recommendation = recommendation_counts.most_common(1)[0][0] if recommendation_counts else ""
     efficiency_diagnosis = _diagnose_run(history, dominant_bottleneck, adjustment_reason_counts)
     benchmark_verdict = _single_run_verdict(
-        use_continuous_batching=config.use_continuous_batching,
+        mode_name=_mode_name(config),
         efficiency_diagnosis=efficiency_diagnosis,
         dominant_bottleneck=dominant_bottleneck,
         steps_with_runtime_adjustment=sum(1 for row in history if float(row.get("runtime_adjustments", 0.0)) > 0.0),
@@ -97,7 +111,9 @@ def _summarize_run(history: list[dict[str, float]], config: GRPOConfig, split: s
         "hardware": _hardware_string(),
         "config_hash": _config_hash(config),
         "steps": len(history),
+        "mode_name": _mode_name(config),
         "use_continuous_batching": config.use_continuous_batching,
+        "use_paged_kv_continuous": config.use_paged_kv_continuous,
         "mean_step_time_ms": mean(float(row.get("total_step_time_ms", 0.0)) for row in history),
         "mean_generation_fraction": mean(generation_fractions),
         "mean_training_fraction": mean(training_fractions),
@@ -122,10 +138,17 @@ def _summarize_run(history: list[dict[str, float]], config: GRPOConfig, split: s
         "mean_scheduler_decode_admitted_kv_mb": mean(
             float(row.get("scheduler_decode_admitted_kv_mb", 0.0)) for row in history
         ),
+        "mean_scheduler_length_sort_passes": mean(
+            float(row.get("scheduler_length_sort_passes", 0.0)) for row in history
+        ),
+        "mean_scheduler_length_sorted_sequences": mean(
+            float(row.get("scheduler_length_sorted_sequences", 0.0)) for row in history
+        ),
         "mean_scheduler_kv_pressure": mean(
             max(
                 float(row.get("scheduler_prefill_kv_pressure", 0.0)),
                 float(row.get("scheduler_decode_kv_pressure", 0.0)),
+                float(row.get("paged_kv_allocator_pressure", 0.0)),
             )
             for row in history
         ),
@@ -163,6 +186,8 @@ def _diagnose_run(
         return "padding-limited"
     if dominant_bottleneck == "kv_budget":
         return "kv-budget-limited"
+    if dominant_bottleneck == "paged_kv":
+        return "paged-kv-limited"
     if dominant_bottleneck in {"decode", "decode_without_cache_reuse"}:
         return "decode-limited"
     if dominant_bottleneck == "prefill":
@@ -174,7 +199,7 @@ def _diagnose_run(
 
 def _single_run_verdict(
     *,
-    use_continuous_batching: bool,
+    mode_name: str,
     efficiency_diagnosis: str,
     dominant_bottleneck: str,
     steps_with_runtime_adjustment: int,
@@ -182,8 +207,7 @@ def _single_run_verdict(
 ) -> str:
     """Render a short human-readable verdict for one run."""
 
-    mode = "continuous batching" if use_continuous_batching else "standard rollout"
-    verdict = f"{mode} was {efficiency_diagnosis}"
+    verdict = f"{mode_name} was {efficiency_diagnosis}"
     if dominant_bottleneck != "balanced":
         verdict += f", dominated by {dominant_bottleneck.replace('_', ' ')}"
     if steps_with_runtime_adjustment > 0:
@@ -199,36 +223,45 @@ def _single_run_verdict(
 def _comparison_verdict(summaries: list[dict[str, object]]) -> str:
     """Render a compact head-to-head conclusion for benchmark comparisons."""
 
-    if len(summaries) != 2:
+    if len(summaries) < 2:
         return "Comparison verdict unavailable."
-
-    ordered = {("continuous" if summary["use_continuous_batching"] else "standard"): summary for summary in summaries}
-    standard = ordered.get("standard")
-    continuous = ordered.get("continuous")
-    if standard is None or continuous is None:
-        return "Comparison verdict unavailable."
-
-    faster = continuous if float(continuous["mean_step_time_ms"]) < float(standard["mean_step_time_ms"]) else standard
-    slower = standard if faster is continuous else continuous
-    faster_name = "continuous batching" if faster is continuous else "standard rollout"
-    slower_name = "standard rollout" if faster is continuous else "continuous batching"
+    ordered = sorted(summaries, key=lambda summary: float(summary["mean_step_time_ms"]))
+    fastest = ordered[0]
+    slowest = ordered[-1]
+    summary_by_mode = {str(summary["mode_name"]): summary for summary in summaries}
 
     verdict = (
-        f"{faster_name} was faster on mean step time than {slower_name}"
-        f" ({float(faster['mean_step_time_ms']):.2f} ms vs {float(slower['mean_step_time_ms']):.2f} ms)"
-        f" but was {faster['efficiency_diagnosis']}."
+        f"Fastest overall: {fastest['mode_name']} "
+        f"({float(fastest['mean_step_time_ms']):.2f} ms mean step time, {fastest['efficiency_diagnosis']}). "
+        f"Slowest overall: {slowest['mode_name']} "
+        f"({float(slowest['mean_step_time_ms']):.2f} ms)."
     )
-    if int(faster["steps_with_runtime_adjustment"]) > 0:
+    legacy = summary_by_mode.get("continuous batching")
+    paged = summary_by_mode.get("paged-kv continuous batching")
+    if legacy is not None and paged is not None:
+        delta_ms = float(legacy["mean_step_time_ms"]) - float(paged["mean_step_time_ms"])
+        direction = "faster" if delta_ms > 0 else "slower"
         verdict += (
-            f" It needed {int(faster['steps_with_runtime_adjustment'])} runtime adjustment"
-            f"{'' if int(faster['steps_with_runtime_adjustment']) == 1 else 's'}."
+            f" Paged-KV continuous batching was {abs(delta_ms):.2f} ms {direction} than legacy continuous batching"
+            f" ({float(paged['mean_step_time_ms']):.2f} ms vs {float(legacy['mean_step_time_ms']):.2f} ms)."
         )
-    elif int(slower["steps_with_runtime_adjustment"]) == 0:
-        verdict += " Both modes stayed stable without runtime adjustment."
+    if int(fastest["steps_with_runtime_adjustment"]) > 0:
+        verdict += (
+            f" Fastest mode needed {int(fastest['steps_with_runtime_adjustment'])} runtime adjustment"
+            f"{'' if int(fastest['steps_with_runtime_adjustment']) == 1 else 's'}."
+        )
+    elif all(int(summary["steps_with_runtime_adjustment"]) == 0 for summary in summaries):
+        verdict += " All modes stayed stable without runtime adjustment."
     return verdict
 
 
-def _run_one(args: argparse.Namespace, use_continuous_batching: bool, output_dir: Path) -> dict[str, object]:
+def _run_one(
+    args: argparse.Namespace,
+    use_continuous_batching: bool,
+    output_dir: Path,
+    *,
+    use_paged_kv_continuous: bool = False,
+) -> dict[str, object]:
     """Run one systems benchmark configuration and write its summary."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -240,6 +273,7 @@ def _run_one(args: argparse.Namespace, use_continuous_batching: bool, output_dir
         max_new_tokens=args.max_new_tokens,
         output_dir=str(output_dir),
         use_continuous_batching=use_continuous_batching,
+        use_paged_kv_continuous=use_paged_kv_continuous,
     )
     trainer = GRPOTrainer(
         config=config,
@@ -260,7 +294,7 @@ def _render_comparison_table(summaries: list[dict[str, object]]) -> str:
         "|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|",
     ]
     for summary in summaries:
-        mode = "continuous" if summary["use_continuous_batching"] else "standard"
+        mode = str(summary["mode_name"])
         lines.append(
             "| "
             f"{mode} | {summary['mean_step_time_ms']:.2f} | {summary['mean_tokens_per_second']:.2f} | "
@@ -280,18 +314,29 @@ def main() -> None:
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.compare_standard_vs_continuous:
+    if args.compare_runtime_modes or args.compare_standard_vs_continuous:
         standard_summary = _run_one(args, use_continuous_batching=False, output_dir=output_dir / "standard")
-        continuous_summary = _run_one(args, use_continuous_batching=True, output_dir=output_dir / "continuous")
+        continuous_summary = _run_one(
+            args,
+            use_continuous_batching=True,
+            output_dir=output_dir / "continuous",
+            use_paged_kv_continuous=False,
+        )
+        paged_kv_summary = _run_one(
+            args,
+            use_continuous_batching=True,
+            output_dir=output_dir / "paged_kv_continuous",
+            use_paged_kv_continuous=True,
+        )
         comparison = {
             "hardware": _hardware_string(),
             "split": args.split,
             "model_name": args.model,
-            "runs": [standard_summary, continuous_summary],
-            "comparison_verdict": _comparison_verdict([standard_summary, continuous_summary]),
+            "runs": [standard_summary, continuous_summary, paged_kv_summary],
+            "comparison_verdict": _comparison_verdict([standard_summary, continuous_summary, paged_kv_summary]),
         }
         (output_dir / "comparison.json").write_text(json.dumps(comparison, indent=2) + "\n", encoding="utf-8")
-        print(_render_comparison_table([standard_summary, continuous_summary]))
+        print(_render_comparison_table([standard_summary, continuous_summary, paged_kv_summary]))
         print()
         print(comparison["comparison_verdict"])
         return

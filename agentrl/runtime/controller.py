@@ -171,9 +171,13 @@ class ExecutionController:
         decode_time_ms = float(metrics.get("decode_time_ms", 0.0))
         cache_reuse = float(metrics.get("cache_reuse_effectiveness", 0.0))
         scheduler_pressure = self._scheduler_kv_pressure(metrics)
+        paged_kv_pressure = float(metrics.get("paged_kv_allocator_pressure", 0.0))
+        paged_kv_preempted = float(metrics.get("paged_kv_preempted_sequences", 0.0))
 
         if max(padding_ratio, generation_padding_ratio) >= 0.35:
             return "padding"
+        if paged_kv_pressure >= 0.9 and paged_kv_preempted > 0:
+            return "paged_kv"
         if scheduler_pressure >= 0.9:
             return "kv_budget"
         if decode_time_ms > prefill_time_ms * 1.5:
@@ -186,11 +190,15 @@ class ExecutionController:
 
     def _recommend_from_metrics(self, metrics: dict[str, float]) -> str:
         bottleneck = self._classify_bottleneck(metrics)
-        scheduler_pressure = self._scheduler_kv_pressure(metrics)
         if bottleneck == "kv_budget":
             return (
                 "Scheduler is near its KV-cache budget; reduce chunk_size, max_new_tokens, "
                 "or prompt length before scaling up."
+            )
+        if bottleneck == "paged_kv":
+            return (
+                "Paged-KV allocator pressure is high and live sequences are being deferred; "
+                "reduce chunk_size, max_new_tokens, or prompt length before scaling concurrency."
             )
         if bottleneck == "padding":
             return "Padding waste is high; reduce chunk_size or group together similar prompt lengths."
@@ -218,7 +226,9 @@ class ExecutionController:
         """Reduce scheduler breadth when KV pressure remains near the configured budget."""
 
         scheduler_pressure = self._scheduler_kv_pressure(metrics)
-        if scheduler_pressure >= 0.9:
+        paged_kv_pressure = float(metrics.get("paged_kv_allocator_pressure", 0.0))
+        effective_pressure = max(scheduler_pressure, paged_kv_pressure)
+        if effective_pressure >= 0.9:
             self._high_kv_pressure_streak += 1
         else:
             self._high_kv_pressure_streak = 0
@@ -312,7 +322,8 @@ class ExecutionController:
     def _scheduler_kv_pressure(self, metrics: dict[str, float]) -> float:
         prefill_pressure = float(metrics.get("scheduler_prefill_kv_pressure", 0.0))
         decode_pressure = float(metrics.get("scheduler_decode_kv_pressure", 0.0))
-        return max(prefill_pressure, decode_pressure)
+        paged_kv_pressure = float(metrics.get("paged_kv_allocator_pressure", 0.0))
+        return max(prefill_pressure, decode_pressure, paged_kv_pressure)
 
     def _risk_level(self, fraction: float | None) -> str:
         if fraction is None:

@@ -1,5 +1,6 @@
 """Public package surface for AgentRL."""
 
+from agentrl.byod import BYODRecord, BYODTask, make_single_turn_task
 from agentrl.core.base import BaseEnvironment, BaseVerifier
 from agentrl.core.config import ConfigurationError, GRPOConfig
 from agentrl.core.sft import SFTBootstrapTrainer
@@ -9,6 +10,8 @@ from agentrl.observability import AgentRLDebugger, MetricsLogger, ReplayBuffer, 
 
 __all__ = [
     "AgentRLDebugger",
+    "BYODRecord",
+    "BYODTask",
     "BaseEnvironment",
     "BaseVerifier",
     "ConfigurationError",
@@ -20,4 +23,5 @@ __all__ = [
     "SystemsProfiler",
     "TrajectoryBuffer",
     "TrajectoryStore",
+    "make_single_turn_task",
 ]

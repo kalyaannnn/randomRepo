@@ -176,6 +176,48 @@ class GRPOTrainer:
                 system_metrics["cache_reuse_effectiveness"] = float(
                     batch.metadata.get("cache_reuse_effectiveness", 0.0)
                 )
+                system_metrics["paged_kv_block_size_tokens"] = float(
+                    batch.metadata.get("paged_kv_block_size_tokens", 0.0)
+                )
+                system_metrics["paged_kv_free_block_count"] = float(
+                    batch.metadata.get("paged_kv_free_block_count", 0.0)
+                )
+                system_metrics["paged_kv_used_block_count"] = float(
+                    batch.metadata.get("paged_kv_used_block_count", 0.0)
+                )
+                system_metrics["paged_kv_allocator_occupancy"] = float(
+                    batch.metadata.get("paged_kv_allocator_occupancy", 0.0)
+                )
+                system_metrics["paged_kv_block_reuse_count"] = float(
+                    batch.metadata.get("paged_kv_block_reuse_count", 0.0)
+                )
+                system_metrics["paged_kv_allocator_pressure"] = float(
+                    batch.metadata.get("paged_kv_allocator_pressure", 0.0)
+                )
+                system_metrics["paged_kv_max_blocks_in_use"] = float(
+                    batch.metadata.get("paged_kv_max_blocks_in_use", 0.0)
+                )
+                system_metrics["paged_kv_resident_sequences"] = float(
+                    batch.metadata.get("paged_kv_resident_sequences", 0.0)
+                )
+                system_metrics["paged_kv_preempted_sequences"] = float(
+                    batch.metadata.get("paged_kv_preempted_sequences", 0.0)
+                )
+                system_metrics["paged_kv_max_preempted_sequences"] = float(
+                    batch.metadata.get("paged_kv_max_preempted_sequences", 0.0)
+                )
+                system_metrics["scheduler_prefill_block_budget"] = float(
+                    batch.metadata.get("scheduler_prefill_block_budget", 0.0)
+                )
+                system_metrics["scheduler_decode_block_budget"] = float(
+                    batch.metadata.get("scheduler_decode_block_budget", 0.0)
+                )
+                system_metrics["scheduler_prefill_admitted_blocks"] = float(
+                    batch.metadata.get("scheduler_prefill_admitted_blocks", 0.0)
+                )
+                system_metrics["scheduler_decode_admitted_blocks"] = float(
+                    batch.metadata.get("scheduler_decode_admitted_blocks", 0.0)
+                )
                 system_metrics["scheduler_prefill_token_budget"] = float(
                     batch.metadata.get("scheduler_prefill_token_budget", 0.0)
                 )

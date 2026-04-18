@@ -43,6 +43,7 @@ class GRPOConfig:
     )
     use_gradient_checkpointing: bool = False
     use_continuous_batching: bool = True
+    use_paged_kv_continuous: bool = False
     use_speculative_decoding: bool = False
     draft_model_name: str | None = None
     speculative_k: int = 4
@@ -191,6 +192,10 @@ class GRPOConfig:
         if self.use_speculative_decoding and not self.draft_model_name:
             raise ConfigurationError(
                 "use_speculative_decoding=True requires draft_model_name to be set."
+            )
+        if self.use_paged_kv_continuous and not self.use_continuous_batching:
+            raise ConfigurationError(
+                "use_paged_kv_continuous=True requires use_continuous_batching=True."
             )
         if not self.use_speculative_decoding and self.draft_model_name is not None:
             raise ConfigurationError(

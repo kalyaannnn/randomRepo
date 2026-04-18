@@ -125,3 +125,149 @@ def test_execution_controller_reports_kv_budget_pressure() -> None:
     assert metrics["dominant_runtime_bottleneck"] == "kv_budget"
     assert metrics["scheduler_kv_pressure"] == 0.96
     assert "KV-cache budget" in str(metrics["runtime_recommendation"])
+
+
+def test_execution_controller_reports_paged_kv_allocator_pressure() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        use_continuous_batching=True,
+        use_paged_kv_continuous=True,
+    )
+    controller = ExecutionController(config=config, device=SimpleNamespace(type="cpu"))
+
+    metrics = controller.observe(
+        {
+            "prefill_time_ms": 10.0,
+            "decode_time_ms": 12.0,
+            "cache_reuse_effectiveness": 0.8,
+            "padding_ratio": 0.05,
+            "paged_kv_allocator_pressure": 0.95,
+            "paged_kv_preempted_sequences": 3.0,
+        }
+    )
+
+    assert metrics["dominant_runtime_bottleneck"] == "paged_kv"
+    assert metrics["scheduler_kv_pressure"] == 0.95
+    assert "Paged-KV allocator pressure" in str(metrics["runtime_recommendation"])
+
+
+def test_execution_controller_reduces_chunk_size_after_paged_kv_pressure_streak() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        group_size=8,
+        chunk_size=8,
+        min_runtime_headroom_mb=1.0,
+        use_continuous_batching=True,
+        use_paged_kv_continuous=True,
+    )
+    controller = ExecutionController(config=config, device=SimpleNamespace(type="cuda"))
+
+    first = controller.observe(
+        {
+            "rollout_runtime_headroom_mb": 2048.0,
+            "padding_ratio": 0.05,
+            "generation_padding_ratio": 0.05,
+            "prefill_time_ms": 10.0,
+            "decode_time_ms": 12.0,
+            "cache_reuse_effectiveness": 0.8,
+            "paged_kv_allocator_pressure": 0.93,
+            "paged_kv_preempted_sequences": 2.0,
+        }
+    )
+    second = controller.observe(
+        {
+            "rollout_runtime_headroom_mb": 2048.0,
+            "padding_ratio": 0.05,
+            "generation_padding_ratio": 0.05,
+            "prefill_time_ms": 10.0,
+            "decode_time_ms": 12.0,
+            "cache_reuse_effectiveness": 0.8,
+            "paged_kv_allocator_pressure": 0.96,
+            "paged_kv_preempted_sequences": 2.0,
+        }
+    )
+
+    assert first["kv_pressure_streak"] == 1.0
+    assert config.chunk_size == 4
+    assert second["last_runtime_adjustment_reason"] == "high_kv_pressure_chunk_size"
+
+
+def test_execution_controller_reduces_chunk_size_after_kv_pressure_streak() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        group_size=8,
+        chunk_size=8,
+        prefill_chunk_size=256,
+        min_runtime_headroom_mb=1.0,
+    )
+    controller = ExecutionController(config=config, device=SimpleNamespace(type="cuda"))
+
+    first = controller.observe(
+        {
+            "rollout_runtime_headroom_mb": 2048.0,
+            "padding_ratio": 0.05,
+            "generation_padding_ratio": 0.05,
+            "prefill_time_ms": 10.0,
+            "decode_time_ms": 12.0,
+            "cache_reuse_effectiveness": 0.8,
+            "scheduler_prefill_kv_pressure": 0.25,
+            "scheduler_decode_kv_pressure": 0.95,
+        }
+    )
+    second = controller.observe(
+        {
+            "rollout_runtime_headroom_mb": 2048.0,
+            "padding_ratio": 0.05,
+            "generation_padding_ratio": 0.05,
+            "prefill_time_ms": 10.0,
+            "decode_time_ms": 12.0,
+            "cache_reuse_effectiveness": 0.8,
+            "scheduler_prefill_kv_pressure": 0.20,
+            "scheduler_decode_kv_pressure": 0.97,
+        }
+    )
+
+    assert first["kv_pressure_streak"] == 1.0
+    assert config.chunk_size == 4
+    assert second["last_runtime_adjustment_reason"] == "high_kv_pressure_chunk_size"
+    assert second["dominant_runtime_bottleneck"] == "kv_budget"
+
+
+def test_execution_controller_reduces_prefill_chunk_size_after_kv_pressure_when_chunk_locked() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        group_size=8,
+        chunk_size=1,
+        prefill_chunk_size=256,
+        min_runtime_headroom_mb=1.0,
+    )
+    controller = ExecutionController(config=config, device=SimpleNamespace(type="cuda"))
+
+    controller.observe(
+        {
+            "rollout_runtime_headroom_mb": 2048.0,
+            "padding_ratio": 0.05,
+            "generation_padding_ratio": 0.05,
+            "prefill_time_ms": 10.0,
+            "decode_time_ms": 12.0,
+            "cache_reuse_effectiveness": 0.8,
+            "scheduler_prefill_kv_pressure": 0.92,
+            "scheduler_decode_kv_pressure": 0.95,
+        }
+    )
+    second = controller.observe(
+        {
+            "rollout_runtime_headroom_mb": 2048.0,
+            "padding_ratio": 0.05,
+            "generation_padding_ratio": 0.05,
+            "prefill_time_ms": 10.0,
+            "decode_time_ms": 12.0,
+            "cache_reuse_effectiveness": 0.8,
+            "scheduler_prefill_kv_pressure": 0.94,
+            "scheduler_decode_kv_pressure": 0.96,
+        }
+    )
+
+    assert config.prefill_chunk_size == 128
+    assert second["last_runtime_adjustment_reason"] == "high_kv_pressure_prefill_chunk_size"
+    assert second["active_prefill_chunk_size"] == 128.0

@@ -55,6 +55,7 @@ def test_config_defaults_match_prompt_surface() -> None:
     assert config.use_lora is True
     assert config.use_gradient_checkpointing is False
     assert config.use_continuous_batching is True
+    assert config.use_paged_kv_continuous is False
     assert config.use_speculative_decoding is False
     assert config.max_episode_steps == 8
     assert config.output_path.name == "checkpoints"
@@ -73,6 +74,15 @@ def test_config_requires_draft_model_for_speculative_decoding() -> None:
         GRPOConfig(
             model_name="Qwen/Qwen2.5-1.5B-Instruct",
             use_speculative_decoding=True,
+        )
+
+
+def test_config_requires_continuous_batching_for_paged_kv_mode() -> None:
+    with pytest.raises(ConfigurationError, match="use_paged_kv_continuous"):
+        GRPOConfig(
+            model_name="Qwen/Qwen2.5-1.5B-Instruct",
+            use_continuous_batching=False,
+            use_paged_kv_continuous=True,
         )
 
 
