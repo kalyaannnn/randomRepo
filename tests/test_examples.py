@@ -21,15 +21,18 @@ from examples.math_env import MathEnvironment, MathProblem, MathVerifier
 def test_readme_mentions_official_byod_api() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     links = re.findall(r"\[[^\]]+\]\(([^)]+)\)", readme)
-    repo_root = Path.cwd()
 
     assert "BYODRecord" in readme
     assert "make_single_turn_task" in readme
-    assert (repo_root / "notebooks/gsm8k_end_to_end.ipynb").is_file()
-    assert (repo_root / "notebooks/byod_onboarding.ipynb").is_file()
-    assert str(repo_root / "docs/bring_your_own_task.md") in links
-    assert str(repo_root / "notebooks/gsm8k_end_to_end.ipynb") in links
-    assert str(repo_root / "notebooks/byod_onboarding.ipynb") in links
+    assert "1.54x faster per step" in readme
+    assert "1.55x higher throughput" in readme
+    assert "2842 MB less rollout VRAM" in readme
+    assert "codeDemo.ipynb" in readme
+
+    for link in links:
+        if link.startswith("http"):
+            continue
+        assert Path(link).is_file(), f"README link does not resolve to a file: {link}"
 
 
 def test_math_environment_and_verifier_roundtrip() -> None:
