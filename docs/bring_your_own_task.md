@@ -46,8 +46,8 @@ For RL:
 
 That matches the existing public surface:
 
-- [agentrl/core/base.py](/Users/kalyaanrao/newProject/agentrl/core/base.py:1)
-- [agentrl/core/sft.py](/Users/kalyaanrao/newProject/agentrl/core/sft.py:1)
+- [agentrl/core/base.py](agentrl/core/base.py:1)
+- [agentrl/core/sft.py](agentrl/core/sft.py:1)
 
 ## Bootstrap Adapter Convention
 
@@ -69,7 +69,7 @@ Subset filtering, curriculum, and prompt formatting remain task-specific decisio
 
 ## Lightweight Example
 
-See [examples/byod_task.py](/Users/kalyaanrao/newProject/examples/byod_task.py:1) for a minimal reference implementation.
+See [examples/byod_task.py](examples/byod_task.py:1) for a minimal reference implementation.
 
 It shows:
 

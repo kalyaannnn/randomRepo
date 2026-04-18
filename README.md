@@ -24,14 +24,14 @@ AgentRL is best understood as three connected layers:
 2. **Post-training proof** — a reference GRPO stack with mandatory SFT bootstrap for serious tasks, strict verifier-driven reward, and first-class adapter lifecycle.
 3. **Task abstraction proof** — the trainer is not tied to one bundled benchmark; tasks plug in through `BaseEnvironment`, `BaseVerifier`, and supervised bootstrap samples.
 
-The public demo shape for this repo should preserve all three. See [docs/open_source_demo.md](/Users/kalyaanrao/newProject/docs/open_source_demo.md) for the end-to-end walkthrough and the external task API contract used to explain portability beyond bundled examples.
+The public demo shape for this repo should preserve all three. See [docs/open_source_demo.md](docs/open_source_demo.md) for the end-to-end walkthrough and the external task API contract used to explain portability beyond bundled examples.
 
-If you want to bring your own dataset rather than use the bundled examples, start with the official v1 onboarding guide in [docs/bring_your_own_task.md](/Users/kalyaanrao/newProject/docs/bring_your_own_task.md). The public BYOD surface stays small: use `BYODRecord` and `make_single_turn_task` for the common single-turn path, and drop to `BaseEnvironment` / `BaseVerifier` only when you need lower-level control.
+If you want to bring your own dataset rather than use the bundled examples, start with the official v1 onboarding guide in [docs/bring_your_own_task.md](docs/bring_your_own_task.md). The public BYOD surface stays small: use `BYODRecord` and `make_single_turn_task` for the common single-turn path, and drop to `BaseEnvironment` / `BaseVerifier` only when you need lower-level control.
 
 Two notebooks show the intended demo shape:
 
-- [notebooks/gsm8k_end_to_end.ipynb](/Users/kalyaanrao/newProject/notebooks/gsm8k_end_to_end.ipynb)
-- [notebooks/byod_onboarding.ipynb](/Users/kalyaanrao/newProject/notebooks/byod_onboarding.ipynb)
+- [notebooks/gsm8k_end_to_end.ipynb](notebooks/gsm8k_end_to_end.ipynb)
+- [notebooks/byod_onboarding.ipynb](notebooks/byod_onboarding.ipynb)
 
 ---
 
@@ -78,7 +78,7 @@ pip install -e ".[dev]"
 
 ## Bring Your Own Task / Dataset
 
-AgentRL is **not** a dataset platform. The official v1 onboarding path is documented in [docs/bring_your_own_task.md](/Users/kalyaanrao/newProject/docs/bring_your_own_task.md), and the lightweight reference implementation remains [examples/byod_task.py](/Users/kalyaanrao/newProject/examples/byod_task.py:1).
+AgentRL is **not** a dataset platform. The official v1 onboarding path is documented in [docs/bring_your_own_task.md](docs/bring_your_own_task.md), and the lightweight reference implementation remains [examples/byod_task.py](examples/byod_task.py:1).
 
 For most single-turn tasks, the intended public API is `BYODRecord` plus `make_single_turn_task(...)`. Use `BaseEnvironment` and `BaseVerifier` directly only when the task genuinely needs custom multi-turn state or another lower-level contract.
 
@@ -203,7 +203,7 @@ If you are showing the project publicly, the cleanest story is:
 2. **Post-training proof** — run `bootstrap -> diagnostic eval -> GRPO -> final eval` on one primary task.
 3. **Task abstraction proof** — show that the same lifecycle can apply to an external task backend that provides supervised bootstrap data, an environment contract, and a deterministic verifier.
 
-The standalone walkthrough in [docs/open_source_demo.md](/Users/kalyaanrao/newProject/docs/open_source_demo.md) is written around that structure.
+The standalone walkthrough in [docs/open_source_demo.md](docs/open_source_demo.md) is written around that structure.
 
 ---
 
@@ -354,7 +354,7 @@ This result is on a filtered easy-curriculum training subset. It is a project be
 - Continuous batching is not a full paged-KV or vLLM-style runtime; optional vLLM-class rollout remains future work (`experimental_vllm_rollout` is reserved and not implemented).
 - `top_p` support may still be limited depending on the code path.
 - The strongest benchmark comparison still comes from explicit bootstrap-vs-post-RL evaluation on saved adapters.
-- External task portability is part of the project story, but the repo does **not** ship a production external task service. The external API-backed integration pattern is documented in [docs/open_source_demo.md](/Users/kalyaanrao/newProject/docs/open_source_demo.md).
+- External task portability is part of the project story, but the repo does **not** ship a production external task service. The external API-backed integration pattern is documented in [docs/open_source_demo.md](docs/open_source_demo.md).
 
 ## Security note
 
