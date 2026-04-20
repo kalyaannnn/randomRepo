@@ -187,6 +187,7 @@ class PagedKVCacheStore:
         self.allocator = allocator
         self._storage: dict[tuple[int, int, int], torch.Tensor] = {}
         self._cache_templates: dict[int, Any] = {}
+        self._resident_caches: dict[int, Any] = {}
 
     @property
     def resident_sequence_count(self) -> int:
@@ -207,6 +208,7 @@ class PagedKVCacheStore:
             keys_to_delete = [key for key in self._storage if key[0] == block_id]
             for key in keys_to_delete:
                 del self._storage[key]
+        self._resident_caches.pop(sequence_id, None)
         self._cache_templates.pop(sequence_id, None)
         self.allocator.release(sequence_id)
 
@@ -215,6 +217,22 @@ class PagedKVCacheStore:
 
     def cache_template(self, sequence_id: int) -> Any:
         return self._cache_templates[sequence_id]
+
+    def set_resident_cache(self, sequence_id: int, cache: Any, cache_template: Any | None = None) -> None:
+        if not self.allocator.has_sequence(sequence_id):
+            raise KeyError(f"Unknown sequence_id {sequence_id}.")
+        self._resident_caches[sequence_id] = cache
+        if cache_template is not None:
+            self._cache_templates[sequence_id] = cache_template
+
+    def resident_cache(self, sequence_id: int) -> Any:
+        return self._resident_caches[sequence_id]
+
+    def has_resident_cache(self, sequence_id: int) -> bool:
+        return sequence_id in self._resident_caches
+
+    def clear_resident_cache(self, sequence_id: int) -> None:
+        self._resident_caches.pop(sequence_id, None)
 
     def write_sequence_cache(
         self,

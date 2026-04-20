@@ -91,6 +91,46 @@ def test_paged_kv_cache_store_roundtrips_legacy_cache() -> None:
     assert torch.equal(restored[0][1], legacy[0][1])
 
 
+def test_paged_kv_cache_store_tracks_resident_tuple_cache() -> None:
+    allocator = PagedKVAllocator(total_blocks=4, block_size_tokens=2)
+    store = PagedKVCacheStore(allocator=allocator)
+    store.reserve(sequence_id=1, token_count=2)
+    legacy = ((torch.ones((1, 1, 2, 1)), torch.zeros((1, 1, 2, 1))),)
+
+    store.set_resident_cache(sequence_id=1, cache=legacy, cache_template=legacy)
+
+    assert store.has_resident_cache(1) is True
+    assert store.resident_cache(1) == legacy
+    assert store.cache_template(1) == legacy
+
+
+@pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
+def test_paged_kv_cache_store_tracks_resident_dynamic_cache() -> None:
+    allocator = PagedKVAllocator(total_blocks=4, block_size_tokens=2)
+    store = PagedKVCacheStore(allocator=allocator)
+    store.reserve(sequence_id=1, token_count=2)
+    legacy = ((torch.ones((1, 1, 2, 1)), torch.zeros((1, 1, 2, 1))),)
+    cache = DynamicCache.from_legacy_cache(legacy)
+
+    store.set_resident_cache(sequence_id=1, cache=cache, cache_template=cache)
+
+    assert store.has_resident_cache(1) is True
+    assert isinstance(store.resident_cache(1), DynamicCache)
+
+
+def test_paged_kv_cache_store_clears_resident_cache_on_release() -> None:
+    allocator = PagedKVAllocator(total_blocks=4, block_size_tokens=2)
+    store = PagedKVCacheStore(allocator=allocator)
+    store.reserve(sequence_id=1, token_count=2)
+    legacy = ((torch.ones((1, 1, 2, 1)), torch.zeros((1, 1, 2, 1))),)
+    store.set_resident_cache(sequence_id=1, cache=legacy, cache_template=legacy)
+
+    store.release(1)
+
+    assert store.has_sequence(1) is False
+    assert store.has_resident_cache(1) is False
+
+
 def test_paged_kv_cache_store_roundtrips_batched_legacy_cache() -> None:
     allocator = PagedKVAllocator(total_blocks=8, block_size_tokens=2)
     store = PagedKVCacheStore(allocator=allocator)
