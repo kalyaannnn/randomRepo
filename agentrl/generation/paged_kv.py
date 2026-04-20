@@ -259,16 +259,30 @@ class PagedKVCacheStore:
         token_count = view.token_count
         layers: list[tuple[torch.Tensor, ...]] = []
 
-        template = self._cache_templates[sequence_id]
-        legacy_template = template if isinstance(template, tuple) else None
-        if legacy_template is None and hasattr(template, "to_legacy_cache"):
-            legacy_template = template.to_legacy_cache()
-        if legacy_template is None:
-            raise TypeError(f"Unsupported cache template for sequence {sequence_id}: {type(template)!r}")
+        keys = [key for key in self._storage if key[0] in view.physical_blocks]
+        if not keys:
+            template = self._cache_templates[sequence_id]
+            legacy_template = template if isinstance(template, tuple) else None
+            if legacy_template is None and hasattr(template, "to_legacy_cache"):
+                legacy_template = template.to_legacy_cache()
+            if legacy_template is None:
+                raise TypeError(f"Unsupported cache template for sequence {sequence_id}: {type(template)!r}")
+            return tuple(
+                tuple(tensor[:, :, :token_count, ...].clone() for tensor in layer_template)
+                for layer_template in legacy_template
+            )
 
-        for layer_index, layer_template in enumerate(legacy_template):
+        layer_indices = sorted({layer_index for _block_id, layer_index, _state_index in keys})
+        for layer_index in layer_indices:
+            state_indices = sorted(
+                {
+                    state_index
+                    for _block_id, key_layer_index, state_index in keys
+                    if key_layer_index == layer_index
+                }
+            )
             states: list[torch.Tensor] = []
-            for state_index, _tensor in enumerate(layer_template):
+            for state_index in state_indices:
                 chunks = [
                     self._storage[(block_id, layer_index, state_index)]
                     for block_id in view.physical_blocks

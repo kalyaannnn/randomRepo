@@ -6,6 +6,11 @@ import torch
 
 from agentrl.generation.paged_kv import PagedKVAllocator, PagedKVCacheStore
 
+try:
+    from transformers.cache_utils import DynamicCache
+except ImportError:  # pragma: no cover - depends on transformers version
+    DynamicCache = None
+
 
 def test_paged_kv_allocator_reserves_and_releases_blocks() -> None:
     allocator = PagedKVAllocator(total_blocks=4, block_size_tokens=2)
@@ -106,3 +111,30 @@ def test_paged_kv_cache_store_roundtrips_batched_legacy_cache() -> None:
 
     assert torch.equal(restored[0][0], batched[0][0])
     assert torch.equal(restored[0][1], batched[0][1])
+
+
+@pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
+def test_paged_kv_cache_store_roundtrips_dynamic_cache_template() -> None:
+    allocator = PagedKVAllocator(total_blocks=8, block_size_tokens=2)
+    store = PagedKVCacheStore(allocator=allocator)
+    store.reserve(sequence_id=1, token_count=3)
+    store.reserve(sequence_id=2, token_count=3)
+
+    batched_legacy = ((
+        torch.tensor([[[[1.0], [2.0], [3.0]]], [[[4.0], [5.0], [6.0]]]]),
+        torch.tensor([[[[7.0], [8.0], [9.0]]], [[[10.0], [11.0], [12.0]]]]),
+    ),)
+    template = DynamicCache.from_legacy_cache(batched_legacy)
+
+    store.write_batched_legacy_cache(
+        [1, 2],
+        legacy_cache=batched_legacy,
+        cache_template=template,
+    )
+
+    restored_legacy = store.read_batched_legacy_cache([1, 2])
+    reconstructed = DynamicCache.from_legacy_cache(restored_legacy)
+
+    assert isinstance(reconstructed, DynamicCache)
+    assert torch.equal(restored_legacy[0][0], batched_legacy[0][0])
+    assert torch.equal(restored_legacy[0][1], batched_legacy[0][1])
