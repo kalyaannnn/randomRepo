@@ -16,6 +16,7 @@ from examples.gsm8k_subset import (
     GSM8KSubsetVerifier,
 )
 from examples.math_env import MathEnvironment, MathProblem, MathVerifier
+from examples.tool_use_env import ToolUseEnvironment, ToolUseVerifier
 
 
 def test_readme_mentions_official_byod_api() -> None:
@@ -531,12 +532,87 @@ def test_benchmark_systems_writes_summary(monkeypatch, tmp_path) -> None:
     summary = (tmp_path / "systems" / "summary.json").read_text(encoding="utf-8")
     assert '"mean_step_time_ms": 100.0' in summary
     assert '"mode_name": "continuous batching"' in summary
+    assert '"task_name": "math"' in summary
     assert '"mean_generation_fraction": 0.6' in summary
     assert '"mean_cache_reuse_effectiveness": 0.7' in summary
     assert '"dominant_runtime_bottleneck": "padding"' in summary
     assert '"efficiency_diagnosis": "padding-limited"' in summary
     assert '"steps_with_runtime_adjustment": 1' in summary
     assert '"benchmark_verdict": "continuous batching was padding-limited, dominated by padding, and needed 1 runtime adjustment.' in summary
+
+
+def test_benchmark_systems_supports_tool_use_task(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    class StubTrainer:
+        def __init__(self, config, environment, verifier):
+            captured["config"] = config
+            captured["environment"] = environment
+            captured["verifier"] = verifier
+
+        def train(self):
+            return [
+                {
+                    "mean_reward": 0.5,
+                    "reward_std": 0.25,
+                    "total_step_time_ms": 120.0,
+                    "generation_time_ms": 72.0,
+                    "training_time_ms": 48.0,
+                    "tokens_per_second": 18.0,
+                    "prefill_tokens_per_second": 28.0,
+                    "decode_tokens_per_second": 14.0,
+                    "padding_ratio": 0.12,
+                    "generation_padding_ratio": 0.18,
+                    "sequence_padding_ratio": 0.09,
+                    "cache_reuse_effectiveness": 0.75,
+                    "peak_vram_mb": 130.0,
+                    "rollout_peak_vram_mb": 118.0,
+                    "rollout_runtime_headroom_mb": 430.0,
+                    "runtime_adjustments": 0.0,
+                    "runtime_low_headroom": 0.0,
+                    "dominant_runtime_bottleneck": "decode",
+                    "runtime_recommendation": "Decode dominates; continuous modes should help on longer-lived episodes.",
+                    "last_runtime_adjustment_reason": "none",
+                }
+            ]
+
+    monkeypatch.setattr(benchmark_systems, "GRPOTrainer", StubTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_systems.py",
+            "--model",
+            "fake/model",
+            "--steps",
+            "2",
+            "--batch-size",
+            "1",
+            "--group-size",
+            "2",
+            "--max-new-tokens",
+            "24",
+            "--max-episode-steps",
+            "4",
+            "--task",
+            "tool-use",
+            "--split",
+            "easy",
+            "--output-dir",
+            str(tmp_path / "systems_tool_use"),
+        ],
+    )
+
+    benchmark_systems_main()
+
+    assert isinstance(captured["environment"], ToolUseEnvironment)
+    assert isinstance(captured["verifier"], ToolUseVerifier)
+    assert captured["config"].max_episode_steps == 4
+
+    summary = (tmp_path / "systems_tool_use" / "summary.json").read_text(encoding="utf-8")
+    assert '"task_name": "tool-use"' in summary
+    assert '"mean_reward": 0.5' in summary
+    assert '"mode_name": "continuous batching"' in summary
 
 
 def test_benchmark_systems_reports_paged_kv_diagnosis(monkeypatch, tmp_path) -> None:

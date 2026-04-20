@@ -39,26 +39,39 @@ If using a larger GPU such as an A100, use the extra headroom to keep the demo s
 
 ## Part 1: Systems Proof
 
-Start with a controlled runtime comparison on the same workload, same model, same decode budget, same `batch_size`, and same `group_size`.
+Start with a controlled runtime comparison on the same workload, same model,
+same decode budget, same `batch_size`, and same `group_size`.
+
+For `v2`, the preferred workload is a short-horizon task-backed multi-turn
+stub rather than the older single-turn math-only benchmark. The tool-use stub
+keeps the task deterministic while stressing:
+
+- uneven active sequence lengths
+- growing transcript context across turns
+- longer-lived decode state
+- scheduler/KV pressure during grouped rollouts
 
 Run:
 
 ```bash
 python -m examples.benchmark_systems \
   --model Qwen/Qwen2.5-1.5B-Instruct \
+  --task tool-use \
   --steps 5 \
   --batch-size 1 \
   --group-size 4 \
   --max-new-tokens 64 \
+  --max-episode-steps 4 \
   --split easy \
   --output-dir ./systems_benchmark_compare \
-  --compare-standard-vs-continuous
+  --compare-runtime-modes
 ```
 
 This produces:
 
 - `./systems_benchmark_compare/standard/summary.json`
 - `./systems_benchmark_compare/continuous/summary.json`
+- `./systems_benchmark_compare/paged_kv_continuous/summary.json`
 - `./systems_benchmark_compare/comparison.json`
 
 Preserve these metrics in the writeup:
@@ -70,6 +83,7 @@ Preserve these metrics in the writeup:
 - `mean_scheduler_kv_pressure`
 - `mean_scheduler_deferred_sequences`
 - `mean_scheduler_max_concurrent_sequences`
+- `mean_reward`
 - `peak_vram_mb`
 - `min_rollout_runtime_headroom_mb`
 - `dominant_runtime_bottleneck`
@@ -79,8 +93,9 @@ Preserve these metrics in the writeup:
 Interpret them explicitly:
 
 - say what bottleneck dominated
-- say why continuous batching did or did not help
+- say why continuous batching or paged-KV continuous batching did or did not help
 - say whether the workload was decode-limited, padding-limited, or KV-budget-limited
+- say whether task reward stayed stable while the runtime improved
 - say that the runtime is a research-grade single-GPU rollout engine, not a production serving stack
 
 Why this matters for RL:

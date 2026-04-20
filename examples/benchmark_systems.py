@@ -14,6 +14,7 @@ import torch
 
 from agentrl import GRPOConfig, GRPOTrainer
 from examples.math_env import MathEnvironment, MathVerifier
+from examples.tool_use_env import ToolUseEnvironment, ToolUseVerifier
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,10 +29,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--group-size", type=int, default=4, help="Responses sampled per prompt.")
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Maximum generated tokens per turn.")
     parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=8,
+        help="Maximum number of turns per episode before truncation.",
+    )
+    parser.add_argument(
+        "--task",
+        default="math",
+        choices=["math", "tool-use"],
+        help="Task-backed workload to benchmark.",
+    )
+    parser.add_argument(
         "--split",
         default="easy",
         choices=["smoke", "easy", "train", "eval"],
-        help="Math benchmark split to sample from.",
+        help="Benchmark split to sample from.",
     )
     parser.add_argument(
         "--output-dir",
@@ -59,7 +72,7 @@ def _hardware_string() -> str:
     return f"cpu:{platform.processor() or platform.machine()}"
 
 
-def _config_hash(config: GRPOConfig) -> str:
+def _config_hash(config: GRPOConfig, *, task_name: str, split: str) -> str:
     """Hash a stable subset of config fields for reproducibility notes."""
 
     payload = {
@@ -68,7 +81,9 @@ def _config_hash(config: GRPOConfig) -> str:
         "batch_size": config.batch_size,
         "group_size": config.group_size,
         "max_new_tokens": config.max_new_tokens,
-        "split": getattr(config, "split", None),
+        "max_episode_steps": config.max_episode_steps,
+        "task_name": task_name,
+        "split": split,
         "use_continuous_batching": config.use_continuous_batching,
         "use_paged_kv_continuous": config.use_paged_kv_continuous,
     }
@@ -83,7 +98,13 @@ def _mode_name(config: GRPOConfig) -> str:
     return "continuous batching"
 
 
-def _summarize_run(history: list[dict[str, float]], config: GRPOConfig, split: str) -> dict[str, object]:
+def _summarize_run(
+    history: list[dict[str, float]],
+    *,
+    config: GRPOConfig,
+    task_name: str,
+    split: str,
+) -> dict[str, object]:
     """Aggregate a per-step history into a compact systems summary."""
 
     generation_fractions = [float(row.get("generation_time_ms", 0.0)) / max(float(row.get("total_step_time_ms", 1e-6)), 1e-6) for row in history]
@@ -107,13 +128,16 @@ def _summarize_run(history: list[dict[str, float]], config: GRPOConfig, split: s
     )
     return {
         "model_name": config.model_name,
+        "task_name": task_name,
         "split": split,
         "hardware": _hardware_string(),
-        "config_hash": _config_hash(config),
+        "config_hash": _config_hash(config, task_name=task_name, split=split),
         "steps": len(history),
         "mode_name": _mode_name(config),
         "use_continuous_batching": config.use_continuous_batching,
         "use_paged_kv_continuous": config.use_paged_kv_continuous,
+        "mean_reward": mean(float(row.get("mean_reward", 0.0)) for row in history),
+        "mean_reward_std": mean(float(row.get("reward_std", 0.0)) for row in history),
         "mean_step_time_ms": mean(float(row.get("total_step_time_ms", 0.0)) for row in history),
         "mean_generation_fraction": mean(generation_fractions),
         "mean_training_fraction": mean(training_fractions),
@@ -271,17 +295,19 @@ def _run_one(
         batch_size=args.batch_size,
         group_size=args.group_size,
         max_new_tokens=args.max_new_tokens,
+        max_episode_steps=args.max_episode_steps,
         output_dir=str(output_dir),
         use_continuous_batching=use_continuous_batching,
         use_paged_kv_continuous=use_paged_kv_continuous,
     )
+    environment, verifier = _build_task(args.task, args.split)
     trainer = GRPOTrainer(
         config=config,
-        environment=MathEnvironment(split=args.split),
-        verifier=MathVerifier(),
+        environment=environment,
+        verifier=verifier,
     )
     history = trainer.train()
-    summary = _summarize_run(history, config=config, split=args.split)
+    summary = _summarize_run(history, config=config, task_name=args.task, split=args.split)
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
@@ -290,14 +316,14 @@ def _render_comparison_table(summaries: list[dict[str, object]]) -> str:
     """Render a tiny markdown comparison table for stdout."""
 
     lines = [
-        "| Mode | Mean step ms | Tokens/s | Padding ratio | KV pressure | Deferred seqs | Max concurrent | Runtime diagnosis | Bottleneck | Adjusted steps | Peak VRAM MB |",
-        "|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|",
+        "| Mode | Mean reward | Mean step ms | Tokens/s | Padding ratio | KV pressure | Deferred seqs | Max concurrent | Runtime diagnosis | Bottleneck | Adjusted steps | Peak VRAM MB |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|",
     ]
     for summary in summaries:
         mode = str(summary["mode_name"])
         lines.append(
             "| "
-            f"{mode} | {summary['mean_step_time_ms']:.2f} | {summary['mean_tokens_per_second']:.2f} | "
+            f"{mode} | {summary['mean_reward']:.4f} | {summary['mean_step_time_ms']:.2f} | {summary['mean_tokens_per_second']:.2f} | "
             f"{summary['mean_padding_ratio']:.4f} | {summary['mean_scheduler_kv_pressure']:.2f} | "
             f"{summary['mean_scheduler_deferred_sequences']:.2f} | "
             f"{summary['mean_scheduler_max_concurrent_sequences']:.2f} | {summary['efficiency_diagnosis']} | "
@@ -330,6 +356,7 @@ def main() -> None:
         )
         comparison = {
             "hardware": _hardware_string(),
+            "task_name": args.task,
             "split": args.split,
             "model_name": args.model,
             "runs": [standard_summary, continuous_summary, paged_kv_summary],
@@ -343,6 +370,16 @@ def main() -> None:
 
     summary = _run_one(args, use_continuous_batching=True, output_dir=output_dir)
     print(json.dumps(summary, indent=2))
+
+
+def _build_task(task_name: str, split: str) -> tuple[object, object]:
+    """Construct the benchmark environment and verifier for one task-backed workload."""
+
+    if task_name == "math":
+        return MathEnvironment(split=split), MathVerifier()
+    if task_name == "tool-use":
+        return ToolUseEnvironment(split=split), ToolUseVerifier()
+    raise ValueError(f"Unsupported task: {task_name}")
 
 
 if __name__ == "__main__":

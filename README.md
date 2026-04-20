@@ -1,57 +1,35 @@
 # AgentRL
 
-AgentRL is a single-GPU rollout/runtime and post-training stack for verifier-based RL.
+Single-GPU rollout/runtime and post-training stack for verifier-based RL: continuous batching, chunked prefill, KV-aware admission, runtime telemetry, supervised bootstrap, GRPO with verifier reward, LoRA adapters, and strict evaluation. Tasks plug in via a small environment/verifier interface; optional BYOD helpers cover common single-turn setups.
 
-It combines three ideas in one repo:
+**Constraints:** one CUDA GPU (CPU OK for smoke tests). No multi-node or multi-GPU orchestration.
 
-- **systems** — continuous batching, chunked prefill, KV-aware admission, runtime headroom tracking, and rollout telemetry on one GPU
-- **post-training** — supervised bootstrap, verifier-based GRPO, strict evaluation, and adapter lifecycle management
-- **task abstraction** — bring your own dataset, verifier, and environment through a small task interface, or use a lightweight high-level BYOD helper for common single-turn tasks
+**Design stance:** not aimed at cold-start RL from a base model alone. Sparse verifier signal is usually insufficient without a bootstrap policy that already lands some correct trajectories; the stack assumes supervised warm-start, rollout diagnosis, optional shaped reward during training only when useful, and strict evaluation at the end.
 
-The intended workflow is **not** cold-start RL. For real tasks, AgentRL is designed around:
+## Components
 
-1. bootstrap a task-specific adapter with supervised data
-2. check whether the bootstrap policy already samples some correct trajectories
-3. continue with verifier-based RL from that adapter
-4. evaluate the saved adapter strictly
+| Area | Contents |
+|------|----------|
+| Runtime | Standard and continuous batching, chunked prefill, persistent-KV decode where supported, controller signals, bottleneck tooling |
+| Training | Reference GRPO path, verifier-driven reward, adapter reuse and checkpointing |
+| Tasks | Dataset/verifier/environment not tied to one benchmark; full control via `BaseEnvironment` / `BaseVerifier`, or high-level BYOD (`BYODRecord`, `make_single_turn_task`) for single-turn `prompt → response → verify` flows |
 
-**Hardware:** one CUDA GPU (or CPU for small tests). No multi-node or multi-GPU orchestration.
+Custom tasks extend `BaseEnvironment.reset`, `step`, `state`, and `BaseVerifier.verify(response, env_state)`.
 
-## What It Is
-
-AgentRL is best understood as three connected layers:
-
-1. **Systems proof** — a research-grade single-GPU rollout runtime with standard and continuous batching, chunked prefill, persistent-KV decode where supported, runtime controller signals, and bottleneck diagnosis.
-2. **Post-training proof** — a reference GRPO stack with supervised bootstrap, verifier-driven reward, LoRA adapter reuse, checkpointing, and strict final evaluation.
-3. **Task abstraction proof** — tasks are not hard-wired to one benchmark; users can bring their own dataset, verifier, and environment.
-
-## Workflow
-
-The supported methodology is:
-
-- **bootstrap first**
-- **diagnose before RL**
-- **use shaped reward during RL only when needed**
-- **keep final evaluation strict**
-
-This matters because sparse verifier reward is often too weak for cold-start RL on real tasks. AgentRL is built around a practical post-training workflow rather than the assumption that strict RL will work from scratch.
-
-## Quick Start
-
-Install:
+## Install
 
 ```bash
 pip install -e .
 pip install -e ".[benchmark]"
 ```
 
-Optional development extras:
+Optional:
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-Minimal GRPO example:
+## Example
 
 ```python
 from agentrl import GRPOConfig, GRPOTrainer
@@ -75,96 +53,60 @@ trainer = GRPOTrainer(
 trainer.train()
 ```
 
-## Task Integration
+## Repository layout
 
-AgentRL supports two task integration paths.
+- `agentrl/` — runtime, rollout, training, public APIs
+- `examples/` — small runnable entry points
+- `notebooks/` — demos (MBPP BYOD code task)
+- `docs/` — integration and demo guides
+- `tests/` — runtime, trainer, task checks
 
-### High-level BYOD path
+## V2 Runtime Benchmark
 
-Use this when the task is a common single-turn `prompt -> response -> verifier` setup.
+The runtime benchmark now supports a short-horizon task-backed multi-turn stub
+in addition to the legacy math workload. This is the intended `v2` finish-line
+benchmark: a deterministic tool-use task that stresses uneven decode lengths,
+growing transcript context, and scheduler / KV behavior without hardbaking any
+agent schema into the library.
 
-- bring your dataset or in-memory records
-- represent records with `BYODRecord`
-- use `make_single_turn_task(...)`
-- provide:
-  - prompt formatting
-  - verifier / reward logic
-  - optional supervised targets for bootstrap
+```bash
+python -m examples.benchmark_systems \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --task tool-use \
+  --split easy \
+  --steps 5 \
+  --batch-size 1 \
+  --group-size 4 \
+  --max-new-tokens 64 \
+  --max-episode-steps 4 \
+  --output-dir ./systems_benchmark_compare \
+  --compare-runtime-modes
+```
 
-Start here:
+This compares:
 
-- [Bring your own task guide](docs/bring_your_own_task.md)
-- [MBPP BYOD notebook](notebooks/codeDemo.ipynb)
+- standard rollout
+- legacy continuous batching
+- paged-KV continuous batching
 
-### Low-level custom task path
+and preserves both systems metrics and task reward so the runtime comparison
+stays grounded in a real multi-turn workload.
 
-Use this when you need more control, especially for:
+## Validation snapshot (MBPP BYOD, execution verifier, single small run)
 
-- custom environment state
-- task-specific step transitions
-- multi-turn tasks
-- richer verifier logic
+Not a benchmark claim: one code-task demo showed continuous vs standard rollout at roughly **1.54x faster per step**, **1.55x higher throughput**, **2842 MB less rollout VRAM**, and **+0.158** mean reward vs standard in that configuration.
 
-Implement:
+## Out of scope (current open-source shape)
 
-- `BaseEnvironment.reset()`
-- `BaseEnvironment.step(action)`
-- `BaseEnvironment.state()`
-- `BaseVerifier.verify(response, env_state)`
-
-This is the primary extension point for custom environments and custom verifiers.
-
-## Demo Path
-
-The featured public demo is the MBPP BYOD notebook:
-
-- [notebooks/codeDemo.ipynb](notebooks/codeDemo.ipynb)
-
-It demonstrates:
-
-- a real external code dataset
-- a custom execution-based verifier
-- shaped reward during RL
-- strict functional final evaluation
-- standard vs continuous batching comparison on the same workload
-
-## Validation Snapshot
-
-On the MBPP BYOD code-task demo with a real execution-based verifier:
-
-- continuous batching was **1.54x faster per step**
-- continuous batching delivered **1.55x higher throughput**
-- continuous batching used **2842 MB less rollout VRAM**
-- continuous batching achieved **+0.158 mean reward** over standard rollout in that small run
-
-These are project validation results, not broad benchmark or SOTA claims.
-
-## Repository Structure
-
-- `agentrl/` — core runtime, rollout, training, and public APIs
-- `examples/` — runnable scripts and small example entry points
-- `notebooks/` — public demo notebooks
-- `docs/` — focused guides and walkthroughs
-- `tests/` — automated validation of runtime, trainer, and task behavior
-
-## What AgentRL Is Not
-
-AgentRL is not, in its current open-source shape:
-
-- a production serving engine
-- a multi-node training stack
-- a hosted task platform
-- a hardened sandbox for executing untrusted code
-
-The current validated story is a research-grade single-GPU rollout/runtime and post-training stack. More advanced runtime-engine work, including paged-KV-style improvements, belongs to the v2 track rather than the validated v1 story.
+Not a production serving engine, multi-node trainer, hosted task platform, or hardened sandbox. Model-generated code in demos runs in a subprocess for evaluation only. Advanced runtime items (e.g. paged-KV-style work) are tracked separately from the validated v1 runtime story.
 
 ## Documentation
 
-- [Bring your own task guide](docs/bring_your_own_task.md)
-- [Open-source demo guide](docs/open_source_demo.md)
+- [Bring your own task](docs/bring_your_own_task.md)
+- [Open-source demo](docs/open_source_demo.md)
 - [MBPP BYOD notebook](notebooks/codeDemo.ipynb)
 
-## Security Note
+## Security
 
-- Replay trajectories are loaded with `torch.load(..., weights_only=False)`. Do not load untrusted trajectory files.
-- Execution-based code-task demos may run model-generated Python in a subprocess for evaluation. This is a demo-grade setup, not a hardened security boundary.
+- Replay trajectories use `torch.load(..., weights_only=False)` — do not load untrusted trajectory files.
+- Execution-based demos are demo-grade isolation, not a security boundary for untrusted code.
