@@ -576,7 +576,9 @@ def test_continuous_batching_stacks_and_splits_dynamic_cache() -> None:
     assert torch.equal(split[1].to_legacy_cache()[0][0], second.to_legacy_cache()[0][0])
 
 
-def test_continuous_batching_reconstructs_constructor_based_cache() -> None:
+def test_continuous_batching_reconstructs_constructor_based_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = GRPOConfig(
         model_name="fake/model",
         batch_size=1,
@@ -593,6 +595,13 @@ def test_continuous_batching_reconstructs_constructor_based_cache() -> None:
     )
     first = ConstructorCache(ddp_cache_data=((torch.zeros((1, 1, 3, 1)), torch.zeros((1, 1, 3, 1))),))
     second = ConstructorCache(ddp_cache_data=((torch.ones((1, 1, 3, 1)), torch.ones((1, 1, 3, 1))),))
+
+    def explode_on_bridge(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("constructor-cache path should not use the generic legacy bridge")
+
+    monkeypatch.setattr(orchestrator, "_cache_to_legacy", explode_on_bridge)
+    monkeypatch.setattr(orchestrator, "_cache_from_legacy", explode_on_bridge)
 
     stacked = orchestrator._stack_past_key_values([first, second])
     split = orchestrator._split_past_key_values(stacked, batch_size=2)

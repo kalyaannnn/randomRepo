@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -1066,6 +1067,8 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             return self._stack_legacy_cache(caches)
         if DynamicCache is not None and isinstance(sample_cache, DynamicCache):
             return self._stack_dynamic_cache(caches)
+        if self._is_constructor_cache(sample_cache):
+            return self._stack_constructor_cache(caches)
         legacy_caches = [self._cache_to_legacy(cache) for cache in caches]
         stacked = self._stack_legacy_cache(legacy_caches)
         return self._cache_from_legacy(sample_cache, stacked)
@@ -1082,6 +1085,8 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             return self._split_legacy_cache(cache)
         if DynamicCache is not None and isinstance(cache, DynamicCache):
             return self._split_dynamic_cache(cache, batch_size)
+        if self._is_constructor_cache(cache):
+            return self._split_constructor_cache(cache, batch_size)
         legacy_cache = self._cache_to_legacy(cache)
         return [
             self._cache_from_legacy(cache, sequence_cache)
@@ -1156,6 +1161,54 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         if keys is None or values is None:
             raise TypeError(f"Unsupported DynamicCache layer type: {type(layer)!r}")
         return keys, values
+
+    def _stack_constructor_cache(self, caches: list[Any]) -> Any:
+        """Batch constructor-based caches without using the generic legacy bridge."""
+
+        stacked = self._stack_legacy_cache([cache.to_legacy_cache() for cache in caches])
+        return self._construct_constructor_cache(caches[0], stacked)
+
+    def _split_constructor_cache(self, cache: Any, batch_size: int) -> list[Any]:
+        """Split a constructor-based cache without using the generic legacy bridge."""
+
+        del batch_size
+        return [
+            self._construct_constructor_cache(cache, sequence_cache)
+            for sequence_cache in self._split_legacy_cache(cache.to_legacy_cache())
+        ]
+
+    @staticmethod
+    def _is_constructor_cache(cache: Any) -> bool:
+        """Return whether the cache uses the repo's constructor-based ddp_cache_data form."""
+
+        if isinstance(cache, tuple):
+            return False
+        if DynamicCache is not None and isinstance(cache, DynamicCache):
+            return False
+        to_legacy_cache = getattr(cache, "to_legacy_cache", None)
+        if not callable(to_legacy_cache):
+            return False
+        try:
+            parameters = inspect.signature(type(cache)).parameters
+        except (TypeError, ValueError):
+            return False
+        return "ddp_cache_data" in parameters
+
+    def _construct_constructor_cache(
+        self,
+        cache_like: Any,
+        ddp_cache_data: tuple[tuple[torch.Tensor, ...], ...],
+    ) -> Any:
+        """Rebuild a constructor-based cache from ddp_cache_data."""
+
+        cache_type = type(cache_like)
+        config = getattr(cache_like, "config", None)
+        if config is not None:
+            try:
+                return cache_type(ddp_cache_data=ddp_cache_data, config=config)
+            except TypeError:
+                pass
+        return cache_type(ddp_cache_data=ddp_cache_data)
 
     def _cache_to_legacy(
         self,
