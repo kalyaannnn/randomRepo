@@ -258,6 +258,16 @@ class ConstructorCache:
         return self._legacy
 
 
+class ConfigRequiredConstructorCache:
+    def __init__(self, ddp_cache_data=None, config=None) -> None:
+        if config is None:
+            raise TypeError("config is required")
+        self._legacy = tuple(ddp_cache_data or ())
+
+    def to_legacy_cache(self):
+        return self._legacy
+
+
 def test_continuous_batching_collects_and_reports_padding_ratio() -> None:
     config = GRPOConfig(
         model_name="fake/model",
@@ -613,6 +623,50 @@ def test_continuous_batching_reconstructs_constructor_based_cache(
     assert torch.equal(split[1].to_legacy_cache()[0][0], second.to_legacy_cache()[0][0])
 
 
+def test_continuous_batching_reconstructs_constructor_cache_requiring_model_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=4,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=Layout(),
+        device=torch.device("cpu"),
+    )
+    model_config = orchestrator.layout.model.config
+    first = ConfigRequiredConstructorCache(
+        ddp_cache_data=((torch.zeros((1, 1, 3, 1)), torch.zeros((1, 1, 3, 1))),),
+        config=model_config,
+    )
+    second = ConfigRequiredConstructorCache(
+        ddp_cache_data=((torch.ones((1, 1, 3, 1)), torch.ones((1, 1, 3, 1))),),
+        config=model_config,
+    )
+
+    def explode_on_bridge(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("constructor-cache path should not use the generic legacy bridge")
+
+    monkeypatch.setattr(orchestrator, "_cache_to_legacy", explode_on_bridge)
+    monkeypatch.setattr(orchestrator, "_cache_from_legacy", explode_on_bridge)
+
+    stacked = orchestrator._stack_past_key_values([first, second])
+    split = orchestrator._split_past_key_values(stacked, batch_size=2)
+
+    assert isinstance(stacked, ConfigRequiredConstructorCache)
+    assert tuple(stacked.to_legacy_cache()[0][0].shape) == (2, 1, 3, 1)
+    assert all(isinstance(item, ConfigRequiredConstructorCache) for item in split)
+    assert torch.equal(split[0].to_legacy_cache()[0][0], first.to_legacy_cache()[0][0])
+    assert torch.equal(split[1].to_legacy_cache()[0][0], second.to_legacy_cache()[0][0])
+
+
 @pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
 def test_continuous_batching_collects_with_dynamic_cache_model() -> None:
     config = GRPOConfig(
@@ -774,10 +828,12 @@ def test_paged_kv_continuous_decode_keeps_legacy_materialization_available(
     responses, _padding_ratio = orchestrator._generate_active_batch_with_cache(sequences, scheduler)
 
     store = captured_store[0]
-    legacy_cache = store.read_sequence_legacy_cache(0)
     resident_cache = store.resident_cache(0).to_legacy_cache()
+    store.clear_resident_cache(0)
+    legacy_cache = store.read_sequence_legacy_cache(0)
 
     assert responses == ["ab", "ab"]
+    assert store.has_resident_cache(0) is False
     assert tuple(legacy_cache[0][0].shape) == (1, 1, 4, 1)
     assert torch.equal(legacy_cache[0][0], resident_cache[0][0])
     assert torch.equal(legacy_cache[0][1], resident_cache[0][1])

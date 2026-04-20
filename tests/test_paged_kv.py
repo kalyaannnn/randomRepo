@@ -120,6 +120,14 @@ def test_paged_kv_cache_store_materializes_from_resident_cache_when_storage_is_s
     assert torch.equal(restored[0][0], resident_legacy[0][0])
     assert torch.equal(restored[0][1], resident_legacy[0][1])
 
+    store.clear_resident_cache(1)
+    restored_after_clear = store.read_sequence_legacy_cache(1)
+
+    assert store.has_resident_cache(1) is False
+    assert tuple(restored_after_clear[0][0].shape) == (1, 1, 4, 1)
+    assert torch.equal(restored_after_clear[0][0], resident_legacy[0][0])
+    assert torch.equal(restored_after_clear[0][1], resident_legacy[0][1])
+
 
 def test_paged_kv_cache_store_tracks_resident_tuple_cache() -> None:
     allocator = PagedKVAllocator(total_blocks=4, block_size_tokens=2)

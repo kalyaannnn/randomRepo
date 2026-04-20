@@ -1202,12 +1202,19 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         """Rebuild a constructor-based cache from ddp_cache_data."""
 
         cache_type = type(cache_like)
-        config = getattr(cache_like, "config", None)
-        if config is not None:
+        configs_to_try = []
+        instance_config = getattr(cache_like, "config", None)
+        if instance_config is not None:
+            configs_to_try.append(instance_config)
+        model_config = getattr(self.layout.model, "config", None)
+        if model_config is not None and model_config is not instance_config:
+            configs_to_try.append(model_config)
+
+        for config in configs_to_try:
             try:
                 return cache_type(ddp_cache_data=ddp_cache_data, config=config)
             except TypeError:
-                pass
+                continue
         return cache_type(ddp_cache_data=ddp_cache_data)
 
     def _cache_to_legacy(

@@ -232,6 +232,14 @@ class PagedKVCacheStore:
         return sequence_id in self._resident_caches
 
     def clear_resident_cache(self, sequence_id: int) -> None:
+        resident_cache = self._resident_caches.get(sequence_id)
+        if resident_cache is not None and self.allocator.has_sequence(sequence_id):
+            cache_template = self._cache_templates.get(sequence_id, resident_cache)
+            self.write_sequence_cache(
+                sequence_id=sequence_id,
+                legacy_cache=self._as_legacy_cache(resident_cache, sequence_id),
+                cache_template=cache_template,
+            )
         self._resident_caches.pop(sequence_id, None)
 
     def write_sequence_cache(
