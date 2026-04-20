@@ -474,27 +474,25 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                     dtype=torch.long,
                     device=self.device,
                 )
-                bucket_cache_legacy = paged_kv.read_batched_legacy_cache(bucket_indices)
-                bucket_cache = self._cache_from_legacy(
-                    paged_kv.cache_template(bucket_indices[0]),
-                    bucket_cache_legacy,
-                )
+                resident_caches = [paged_kv.resident_cache(index) for index in bucket_indices]
+                bucket_cache = self._stack_past_key_values(resident_caches)
                 outputs = generation_model(
                     input_ids=bucket_tokens,
                     attention_mask=bucket_attention,
                     past_key_values=bucket_cache,
                     use_cache=True,
                 )
+                split_caches = self._split_past_key_values(outputs.past_key_values, len(bucket_indices))
                 bucket_logits = outputs.logits[:, -1, :]
                 for episode_index, token_tensor in bucket:
                     paged_kv.append_tokens(episode_index, int(token_tensor.numel()))
-                paged_kv.write_batched_legacy_cache(
-                    bucket_indices,
-                    self._cache_to_legacy(outputs.past_key_values),
-                    outputs.past_key_values,
-                )
 
                 for offset, episode_index in enumerate(bucket_indices):
+                    paged_kv.set_resident_cache(
+                        sequence_id=episode_index,
+                        cache=split_caches[offset],
+                        cache_template=split_caches[offset],
+                    )
                     sequence_lengths[episode_index] += 1
                     next_logits_by_index[episode_index] = bucket_logits[offset : offset + 1]
         self._runtime_stats["decode_time_ms"] += (time.perf_counter() - decode_start) * 1000.0

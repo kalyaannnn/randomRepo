@@ -8,6 +8,7 @@ import pytest
 from agentrl.core.base import BaseEnvironment, BaseVerifier
 from agentrl.core.config import GRPOConfig
 from agentrl.generation.continuous import ContinuousBatchingOrchestrator, _ScheduledSequence
+from agentrl.generation.paged_kv import PagedKVCacheStore
 
 try:
     from transformers.cache_utils import DynamicCache
@@ -651,6 +652,40 @@ def test_paged_kv_continuous_collects_with_dynamic_cache_model() -> None:
     assert batch.metadata["responses"] == [["ab", "ab"]]
     assert batch.metadata["paged_kv_block_size_tokens"] == 16.0
     assert batch.metadata["paged_kv_max_blocks_in_use"] >= 1.0
+
+
+@pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
+def test_paged_kv_continuous_decode_uses_resident_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=2,
+        use_paged_kv_continuous=True,
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=DynamicCacheLayout(),
+        device=torch.device("cpu"),
+    )
+
+    def explode_on_decode(self, sequence_ids: list[int]):
+        raise AssertionError(
+            "decode path should not rebuild from legacy cache: "
+            f"read_batched_legacy_cache({sequence_ids})"
+        )
+
+    monkeypatch.setattr(PagedKVCacheStore, "read_batched_legacy_cache", explode_on_decode)
+
+    batch = orchestrator.collect()
+
+    assert batch.metadata["responses"] == [["ab", "ab"]]
 
 
 @pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
