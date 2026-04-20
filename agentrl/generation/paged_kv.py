@@ -204,12 +204,12 @@ class PagedKVCacheStore:
 
     def release(self, sequence_id: int) -> None:
         view = self.allocator.view(sequence_id)
+        self._resident_caches.pop(sequence_id, None)
+        self._cache_templates.pop(sequence_id, None)
         for block_id in view.physical_blocks:
             keys_to_delete = [key for key in self._storage if key[0] == block_id]
             for key in keys_to_delete:
                 del self._storage[key]
-        self._resident_caches.pop(sequence_id, None)
-        self._cache_templates.pop(sequence_id, None)
         self.allocator.release(sequence_id)
 
     def metrics(self) -> dict[str, float]:

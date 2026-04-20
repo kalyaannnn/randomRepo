@@ -490,15 +490,16 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 )
                 split_caches = self._split_past_key_values(outputs.past_key_values, len(bucket_indices))
                 bucket_logits = outputs.logits[:, -1, :]
-                for episode_index, token_tensor in bucket:
-                    paged_kv.append_tokens(episode_index, int(token_tensor.numel()))
-
                 for offset, episode_index in enumerate(bucket_indices):
                     paged_kv.set_resident_cache(
                         sequence_id=episode_index,
                         cache=split_caches[offset],
                         cache_template=split_caches[offset],
                     )
+                for episode_index, token_tensor in bucket:
+                    paged_kv.append_tokens(episode_index, int(token_tensor.numel()))
+
+                for offset, episode_index in enumerate(bucket_indices):
                     sequence_lengths[episode_index] += 1
                     next_logits_by_index[episode_index] = bucket_logits[offset : offset + 1]
         self._runtime_stats["decode_time_ms"] += (time.perf_counter() - decode_start) * 1000.0

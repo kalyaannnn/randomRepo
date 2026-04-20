@@ -987,3 +987,27 @@ def test_paged_kv_continuous_dynamic_cache_handles_block_growth() -> None:
     assert batch.rewards.tolist() == [[1.0, 1.0]]
     assert batch.metadata["responses"] == [["ab", "ab"]]
     assert batch.metadata["paged_kv_max_blocks_in_use"] >= 2.0
+
+
+@pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
+def test_paged_kv_releases_finished_sequences_and_keeps_resident_state() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=3,
+        use_paged_kv_continuous=True,
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=DynamicCacheLayout(),
+        device=torch.device("cpu"),
+    )
+
+    batch = orchestrator.collect()
+
+    assert batch.rewards.tolist() == [[1.0, 1.0]]
