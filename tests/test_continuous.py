@@ -689,12 +689,30 @@ def test_paged_kv_continuous_decode_uses_resident_caches(
             f"write_batched_legacy_cache({sequence_ids})"
         )
 
+    original_to_legacy = orchestrator._cache_to_legacy
+    original_from_legacy = orchestrator._cache_from_legacy
+    conversion_counts = {"to_legacy": 0, "from_legacy": 0}
+
+    def guarded_cache_to_legacy(cache):
+        conversion_counts["to_legacy"] += 1
+        if conversion_counts["to_legacy"] > 2:
+            raise AssertionError("decode path should not convert DynamicCache to legacy tuples")
+        return original_to_legacy(cache)
+
+    def guarded_cache_from_legacy(cache_like, legacy_cache):
+        del legacy_cache
+        conversion_counts["from_legacy"] += 1
+        raise AssertionError("decode path should not rebuild DynamicCache from legacy tuples")
+
     monkeypatch.setattr(PagedKVCacheStore, "read_batched_legacy_cache", explode_on_decode_read)
     monkeypatch.setattr(PagedKVCacheStore, "write_batched_legacy_cache", explode_on_decode_write)
+    monkeypatch.setattr(orchestrator, "_cache_to_legacy", guarded_cache_to_legacy)
+    monkeypatch.setattr(orchestrator, "_cache_from_legacy", guarded_cache_from_legacy)
 
     batch = orchestrator.collect()
 
     assert batch.metadata["responses"] == [["ab", "ab"]]
+    assert conversion_counts == {"to_legacy": 2, "from_legacy": 0}
 
 
 @pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")

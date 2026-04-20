@@ -19,6 +19,11 @@ from agentrl.generation.scheduler import (
     kv_cache_geometry,
 )
 
+try:
+    from transformers.cache_utils import DynamicCache
+except ImportError:  # pragma: no cover - transformers is a required dependency in normal runs
+    DynamicCache = None
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1059,6 +1064,8 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         sample_cache = caches[0]
         if isinstance(sample_cache, tuple):
             return self._stack_legacy_cache(caches)
+        if DynamicCache is not None and isinstance(sample_cache, DynamicCache):
+            return self._stack_dynamic_cache(caches)
         legacy_caches = [self._cache_to_legacy(cache) for cache in caches]
         stacked = self._stack_legacy_cache(legacy_caches)
         return self._cache_from_legacy(sample_cache, stacked)
@@ -1073,11 +1080,82 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
 
         if isinstance(cache, tuple):
             return self._split_legacy_cache(cache)
+        if DynamicCache is not None and isinstance(cache, DynamicCache):
+            return self._split_dynamic_cache(cache, batch_size)
         legacy_cache = self._cache_to_legacy(cache)
         return [
             self._cache_from_legacy(cache, sequence_cache)
             for sequence_cache in self._split_legacy_cache(legacy_cache)
         ]
+
+    def _stack_dynamic_cache(self, caches: list[Any]) -> Any:
+        """Batch DynamicCache instances without converting through legacy tuples."""
+
+        sample_cache = caches[0]
+        ddp_cache_layers = []
+        for layer_index in range(len(sample_cache.layers)):
+            layer_tensors = [self._dynamic_cache_layer_tensors(cache.layers[layer_index]) for cache in caches]
+            ddp_cache_layers.append(
+                (
+                    torch.cat([keys for keys, _values in layer_tensors], dim=0),
+                    torch.cat([values for _keys, values in layer_tensors], dim=0),
+                )
+            )
+        ddp_cache_data = tuple(ddp_cache_layers)
+        return self._construct_dynamic_cache(sample_cache, ddp_cache_data)
+
+    def _split_dynamic_cache(self, cache: Any, batch_size: int) -> list[Any]:
+        """Split a batched DynamicCache without converting through legacy tuples."""
+
+        return [
+            self._construct_dynamic_cache(
+                cache,
+                tuple(
+                    (
+                        self._dynamic_cache_layer_tensors(layer)[0][batch_index : batch_index + 1].clone(),
+                        self._dynamic_cache_layer_tensors(layer)[1][batch_index : batch_index + 1].clone(),
+                    )
+                    for layer in cache.layers
+                ),
+            )
+            for batch_index in range(batch_size)
+        ]
+
+    def _construct_dynamic_cache(
+        self,
+        cache_like: Any,
+        ddp_cache_data: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    ) -> Any:
+        """Rebuild a DynamicCache-compatible instance from layer tensors."""
+
+        cache_type = type(cache_like)
+        cache_kwargs: dict[str, Any] = {}
+        config = getattr(self.layout.model, "config", None)
+        if config is not None and hasattr(config, "get_text_config"):
+            cache_kwargs["config"] = config
+        offloading = getattr(cache_like, "offloading", None)
+        if offloading is not None:
+            cache_kwargs["offloading"] = offloading
+        offload_only_non_sliding = getattr(cache_like, "only_non_sliding", None)
+        if offload_only_non_sliding is not None:
+            cache_kwargs["offload_only_non_sliding"] = offload_only_non_sliding
+        try:
+            return cache_type(ddp_cache_data=ddp_cache_data, **cache_kwargs)
+        except TypeError:
+            return cache_type(ddp_cache_data=ddp_cache_data)
+
+    @staticmethod
+    def _dynamic_cache_layer_tensors(layer: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract key/value tensors from a DynamicCache layer."""
+
+        keys = getattr(layer, "keys", None)
+        values = getattr(layer, "values", None)
+        if keys is None or values is None:
+            keys = getattr(layer, "key_cache", None)
+            values = getattr(layer, "value_cache", None)
+        if keys is None or values is None:
+            raise TypeError(f"Unsupported DynamicCache layer type: {type(layer)!r}")
+        return keys, values
 
     def _cache_to_legacy(
         self,
