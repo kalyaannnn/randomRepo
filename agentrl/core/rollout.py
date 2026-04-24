@@ -24,9 +24,8 @@ class RolloutBatch:
 
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
-    action_mask: torch.Tensor
-    policy_logprobs: torch.Tensor
-    ref_logprobs: torch.Tensor
+    completion_mask: torch.Tensor
+    old_policy_logprobs: torch.Tensor
     rewards: torch.Tensor
     advantages: torch.Tensor
     metadata: dict[str, Any]
@@ -71,10 +70,10 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
                 prompt_group.append(self._run_episode(env, initial_observation))
             episodes.extend(prompt_group)
 
-        input_ids, attention_mask, action_mask = self._pack_sequences(episodes)
+        input_ids, attention_mask, completion_mask = self._pack_sequences(episodes)
         flat_input_ids = input_ids.view(-1, input_ids.shape[-1])
         flat_attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
-        flat_action_mask = action_mask.view(-1, action_mask.shape[-1])
+        flat_completion_mask = completion_mask.view(-1, completion_mask.shape[-1])
 
         model_config = getattr(self.layout.model, "config", None)
         if model_config is not None:
@@ -85,13 +84,7 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
                 self.layout.policy_forward,
                 flat_input_ids,
                 flat_attention_mask,
-                flat_action_mask,
-            )
-            ref_sequences = self._compute_logprobs(
-                self.layout.reference_forward,
-                flat_input_ids,
-                flat_attention_mask,
-                flat_action_mask,
+                flat_completion_mask,
             )
 
         if model_config is not None:
@@ -109,9 +102,8 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         return RolloutBatch(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            action_mask=action_mask,
-            policy_logprobs=policy_sequences.view_as(input_ids),
-            ref_logprobs=ref_sequences.view_as(input_ids),
+            completion_mask=completion_mask,
+            old_policy_logprobs=policy_sequences.view_as(input_ids),
             rewards=rewards,
             advantages=advantages,
             metadata=metadata,
@@ -359,11 +351,11 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         tokenized: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         max_length = 0
         for episode in episodes:
-            seq_ids, seq_attention, seq_action = self._tokenize_transcript(
+            seq_ids, seq_attention, seq_completion = self._tokenize_transcript(
                 episode["transcript_text"],
                 episode["assistant_spans"],
             )
-            tokenized.append((seq_ids, seq_attention, seq_action))
+            tokenized.append((seq_ids, seq_attention, seq_completion))
             max_length = max(max_length, int(seq_ids.numel()))
 
         if self.config.pad_to_multiple_of is not None and max_length > 0:
@@ -373,27 +365,27 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
 
         padded_ids: list[torch.Tensor] = []
         padded_attention: list[torch.Tensor] = []
-        padded_action: list[torch.Tensor] = []
+        padded_completion: list[torch.Tensor] = []
         pad_token_id = int(self.tokenizer.pad_token_id)
 
-        for seq_ids, seq_attention, seq_action in tokenized:
+        for seq_ids, seq_attention, seq_completion in tokenized:
             pad_amount = max_length - int(seq_ids.numel())
             padded_ids.append(torch.nn.functional.pad(seq_ids, (0, pad_amount), value=pad_token_id))
             padded_attention.append(torch.nn.functional.pad(seq_attention, (0, pad_amount), value=0))
-            padded_action.append(torch.nn.functional.pad(seq_action, (0, pad_amount), value=0))
+            padded_completion.append(torch.nn.functional.pad(seq_completion, (0, pad_amount), value=0))
 
         stacked_ids = torch.stack(padded_ids, dim=0).to(self.device)
         stacked_attention = torch.stack(padded_attention, dim=0).to(self.device)
-        stacked_action = torch.stack(padded_action, dim=0).to(self.device)
+        stacked_completion = torch.stack(padded_completion, dim=0).to(self.device)
         total_token_capacity = max_length * len(tokenized)
-        total_real_tokens = sum(int(seq_ids.numel()) for seq_ids, _seq_attention, _seq_action in tokenized)
+        total_real_tokens = sum(int(seq_ids.numel()) for seq_ids, _seq_attention, _seq_completion in tokenized)
         self._runtime_stats["sequence_padding_waste_tokens"] = float(total_token_capacity - total_real_tokens)
         self._runtime_stats["sequence_padding_total_tokens"] = float(total_token_capacity)
         shape = (self.config.batch_size, self.config.group_size, max_length)
         return (
             stacked_ids.view(shape),
             stacked_attention.view(shape),
-            stacked_action.view(shape),
+            stacked_completion.view(shape),
         )
 
     def _tokenize_transcript(
@@ -416,14 +408,14 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         if offsets is None:
             return self._fallback_piecewise_tokenize(transcript_text, assistant_spans)
 
-        action_mask = torch.zeros(input_ids.shape[-1], dtype=torch.bool)
+        completion_mask = torch.zeros(input_ids.shape[-1], dtype=torch.bool)
         for token_index, (start, end) in enumerate(offsets[0].tolist()):
             if end <= start:
                 continue
             if any(start < span_end and end > span_start for span_start, span_end in assistant_spans):
-                action_mask[token_index] = True
+                completion_mask[token_index] = True
 
-        return input_ids, attention_mask, action_mask
+        return input_ids, attention_mask, completion_mask
 
     def _fallback_piecewise_tokenize(
         self,
@@ -441,28 +433,32 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             {0, len(transcript_text), *[item for span in assistant_spans for item in span]}
         )
         token_ids_parts: list[torch.Tensor] = []
-        action_mask_parts: list[torch.Tensor] = []
+        completion_mask_parts: list[torch.Tensor] = []
         for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
             segment = transcript_text[start:end]
             if not segment:
                 continue
             encoded = self.tokenizer(segment, return_tensors="pt", add_special_tokens=False)
             segment_ids = encoded["input_ids"][0].to(dtype=torch.long)
-            is_action = any(start >= span_start and end <= span_end for span_start, span_end in assistant_spans)
+            is_completion = any(
+                start >= span_start and end <= span_end for span_start, span_end in assistant_spans
+            )
             token_ids_parts.append(segment_ids)
-            action_mask_parts.append(torch.full((segment_ids.numel(),), is_action, dtype=torch.bool))
+            completion_mask_parts.append(
+                torch.full((segment_ids.numel(),), is_completion, dtype=torch.bool)
+            )
 
         input_ids = torch.cat(token_ids_parts, dim=0)
         attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        action_mask = torch.cat(action_mask_parts, dim=0)
-        return input_ids, attention_mask, action_mask
+        completion_mask = torch.cat(completion_mask_parts, dim=0)
+        return input_ids, attention_mask, completion_mask
 
     def _compute_logprobs(
         self,
         forward_fn: Any,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        action_mask: torch.Tensor,
+        completion_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Compute per-token logprobs aligned to sequence positions."""
 
@@ -472,7 +468,7 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         gathered = token_logprobs.gather(dim=-1, index=next_tokens).squeeze(-1)
 
         aligned = torch.zeros_like(input_ids, dtype=logits.dtype)
-        aligned[:, 1:] = gathered * action_mask[:, 1:].to(dtype=logits.dtype)
+        aligned[:, 1:] = gathered * completion_mask[:, 1:].to(dtype=logits.dtype)
         return aligned
 
     def _compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:

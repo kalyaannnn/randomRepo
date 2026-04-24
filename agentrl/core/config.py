@@ -22,7 +22,10 @@ class GRPOConfig:
     group_size: int = 8
     batch_size: int = 4
     max_new_tokens: int = 512
-    beta: float = 0.01
+    beta: float = 0.0
+    epsilon: float = 0.2
+    num_iterations: int = 1
+    grpo_mode: str = "trl"
     lr: float = 1e-5
     lr_scheduler: str = "constant"
     warmup_steps: int = 0
@@ -109,6 +112,7 @@ class GRPOConfig:
         self._validate_positive_int("group_size", self.group_size, minimum=2)
         self._validate_positive_int("batch_size", self.batch_size)
         self._validate_positive_int("max_new_tokens", self.max_new_tokens)
+        self._validate_positive_int("num_iterations", self.num_iterations)
         self._validate_positive_int("steps", self.steps)
         self._validate_positive_int("lora_r", self.lora_r)
         self._validate_positive_int("lora_alpha", self.lora_alpha)
@@ -125,6 +129,7 @@ class GRPOConfig:
         self._validate_positive_int("async_trajectory_max_pending_batches", self.async_trajectory_max_pending_batches)
 
         self._validate_probability("beta", self.beta, allow_one=True)
+        self._validate_probability("epsilon", self.epsilon, allow_one=True)
         self._validate_probability("lora_dropout", self.lora_dropout, allow_one=True)
         self._validate_probability("adam_beta1", self.adam_beta1, allow_one=False)
         self._validate_probability("adam_beta2", self.adam_beta2, allow_one=False)
@@ -188,6 +193,22 @@ class GRPOConfig:
                 "use_lora=False is not supported yet. AgentRL currently depends on the "
                 "shared-weight LoRA/reference layout."
             )
+        if self.num_iterations != 1:
+            raise ConfigurationError(
+                "num_iterations must be 1 for the TRL-compatible GRPO redesign."
+            )
+        if self.grpo_mode != "trl":
+            raise ConfigurationError(
+                "grpo_mode must be 'trl' for the TRL-compatible GRPO redesign."
+            )
+        if self.use_adaptive_kl:
+            raise ConfigurationError(
+                "use_adaptive_kl=True is not supported in the TRL-compatible GRPO redesign."
+            )
+        if self.kl_target is not None:
+            raise ConfigurationError(
+                "kl_target is not supported in the TRL-compatible GRPO redesign."
+            )
 
         if self.use_speculative_decoding and not self.draft_model_name:
             raise ConfigurationError(
@@ -204,9 +225,6 @@ class GRPOConfig:
             )
         if self.log_to_wandb and not self.wandb_project:
             raise ConfigurationError("log_to_wandb=True requires wandb_project.")
-        if self.use_adaptive_kl and self.kl_target is None:
-            raise ConfigurationError("use_adaptive_kl=True requires kl_target.")
-
         self._output_path = Path(self.output_dir).expanduser()
         self._profile_path = Path(self.profile_dir).expanduser()
 

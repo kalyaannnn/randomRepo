@@ -46,7 +46,8 @@ def test_config_defaults_match_prompt_surface() -> None:
     assert config.group_size == 8
     assert config.batch_size == 4
     assert config.max_new_tokens == 512
-    assert config.beta == 0.01
+    assert config.beta == 0.0
+    assert config.epsilon == 0.2
     assert config.lr == 1e-5
     assert config.lr_scheduler == "constant"
     assert config.warmup_steps == 0
@@ -62,6 +63,8 @@ def test_config_defaults_match_prompt_surface() -> None:
     assert config.profile_steps is None
     assert config.profile_path.name == "profiles"
     assert config.use_adaptive_kl is False
+    assert config.num_iterations == 1
+    assert config.grpo_mode == "trl"
     assert config.use_async_rollout_workers is False
     assert config.use_async_trajectory_copy is False
     assert config.experimental_vllm_rollout is False
@@ -104,9 +107,29 @@ def test_config_rejects_invalid_lr_scheduler() -> None:
         GRPOConfig(model_name="Qwen/Qwen2.5-1.5B-Instruct", lr_scheduler="linear")
 
 
-def test_config_requires_kl_target_for_adaptive_kl() -> None:
-    with pytest.raises(ConfigurationError, match="kl_target"):
-        GRPOConfig(model_name="Qwen/Qwen2.5-1.5B-Instruct", use_adaptive_kl=True)
+def test_config_rejects_num_iterations_other_than_one() -> None:
+    with pytest.raises(ConfigurationError, match="num_iterations"):
+        GRPOConfig(model_name="Qwen/Qwen2.5-1.5B-Instruct", num_iterations=2)
+
+
+def test_config_rejects_non_trl_grpo_mode() -> None:
+    with pytest.raises(ConfigurationError, match="grpo_mode"):
+        GRPOConfig(model_name="Qwen/Qwen2.5-1.5B-Instruct", grpo_mode="legacy")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_message"),
+    [
+        ({"use_adaptive_kl": True}, "use_adaptive_kl"),
+        ({"kl_target": 0.1}, "kl_target"),
+    ],
+)
+def test_config_rejects_adaptive_kl_options_in_trl_mode(
+    kwargs: dict[str, bool | float],
+    expected_message: str,
+) -> None:
+    with pytest.raises(ConfigurationError, match=expected_message):
+        GRPOConfig(model_name="Qwen/Qwen2.5-1.5B-Instruct", **kwargs)
 
 
 def test_config_rejects_invalid_max_episode_steps() -> None:

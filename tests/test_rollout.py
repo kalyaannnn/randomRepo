@@ -101,14 +101,6 @@ class FakeLayout:
         logits[:, :, 65] = 1.0
         return logits
 
-    def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        del attention_mask
-        batch, seq = input_ids.shape
-        vocab = 256
-        logits = torch.zeros((batch, seq, vocab), dtype=torch.float32)
-        logits[:, :, 66] = 1.0
-        return logits
-
 
 class ChunkedPrefillModel(torch.nn.Module):
     def __init__(self, output: str) -> None:
@@ -150,11 +142,6 @@ class ChunkedPrefillLayout:
         batch, seq = input_ids.shape
         return torch.zeros((batch, seq, 256), dtype=torch.float32)
 
-    def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        del attention_mask
-        batch, seq = input_ids.shape
-        return torch.zeros((batch, seq, 256), dtype=torch.float32)
-
 
 def test_rollout_collects_multi_turn_grouped_batch() -> None:
     config = GRPOConfig(
@@ -179,17 +166,52 @@ def test_rollout_collects_multi_turn_grouped_batch() -> None:
     assert batch.input_ids.shape[0:2] == (1, 2)
     assert batch.input_ids.shape[-1] % config.pad_to_multiple_of == 0
     assert batch.attention_mask.shape == batch.input_ids.shape
-    assert batch.action_mask.shape == batch.input_ids.shape
+    assert batch.completion_mask.shape == batch.input_ids.shape
+    assert batch.old_policy_logprobs.shape == batch.input_ids.shape
     assert batch.rewards.tolist() == [[1.0, 0.0]]
     assert batch.advantages[0, 0].item() == pytest.approx(1.0, rel=1e-5)
     assert batch.advantages[0, 1].item() == pytest.approx(-1.0, rel=1e-5)
-    assert batch.action_mask.sum().item() > 0
+    assert batch.completion_mask.sum().item() > 0
     assert batch.metadata["responses"] == [["done", "bad"]]
     assert batch.metadata["prefill_tokens"] > 0.0
     assert batch.metadata["decode_tokens"] > 0.0
     assert "prefill_tokens_per_second" in batch.metadata
     assert "decode_tokens_per_second" in batch.metadata
     assert "padding_waste_tokens" in batch.metadata
+
+
+def test_rollout_completion_mask_and_old_policy_logprobs_follow_completion_tokens() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=8,
+        max_episode_steps=3,
+    )
+    layout = FakeLayout(outputs=["plan", "done", "plan", "bad"])
+    orchestrator = RolloutOrchestrator(
+        config=config,
+        environment=TwoTurnEnvironment(),
+        verifier=FinalAnswerVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=layout,
+        device=torch.device("cpu"),
+    )
+
+    batch = orchestrator.collect()
+
+    transcript = batch.metadata["transcripts"][0][0]
+    expected_mask = torch.zeros_like(batch.completion_mask[0, 0], dtype=torch.bool)
+    for completion_text in ("plan", "done"):
+        start = transcript.index(completion_text)
+        end = start + len(completion_text)
+        expected_mask[start:end] = True
+
+    assert transcript.startswith("Observation:\nstart\n\nAssistant:\nplan")
+    assert torch.equal(batch.completion_mask[0, 0], expected_mask)
+    assert batch.completion_mask[0, 0, 0].item() is False
+    assert torch.all(batch.old_policy_logprobs.masked_select(~batch.completion_mask) == 0)
+    assert torch.any(batch.old_policy_logprobs.masked_select(batch.completion_mask) != 0)
 
 
 def test_rollout_warns_when_episode_hits_turn_cap(caplog: pytest.LogCaptureFixture) -> None:
