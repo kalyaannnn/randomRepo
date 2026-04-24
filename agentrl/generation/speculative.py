@@ -78,18 +78,7 @@ class SpeculativeRolloutOrchestrator(RolloutOrchestrator):
                 prompt_group.append(self._run_episode(env, initial_observation))
             episodes.extend(prompt_group)
 
-        input_ids, attention_mask, action_mask, policy_logprobs = self._pack_speculative_sequences(episodes)
-        flat_input_ids = input_ids.view(-1, input_ids.shape[-1])
-        flat_attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
-        flat_action_mask = action_mask.view(-1, action_mask.shape[-1])
-
-        with torch.no_grad():
-            ref_logprobs = self._compute_logprobs(
-                self.layout.reference_forward,
-                flat_input_ids,
-                flat_attention_mask,
-                flat_action_mask,
-            )
+        input_ids, attention_mask, completion_mask, old_policy_logprobs = self._pack_speculative_sequences(episodes)
 
         rewards = torch.tensor(
             [[episode["reward"] for episode in episodes[i : i + self.config.group_size]]
@@ -104,9 +93,8 @@ class SpeculativeRolloutOrchestrator(RolloutOrchestrator):
         return RolloutBatch(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            action_mask=action_mask,
-            policy_logprobs=policy_logprobs,
-            ref_logprobs=ref_logprobs.view_as(input_ids),
+            completion_mask=completion_mask,
+            old_policy_logprobs=old_policy_logprobs,
             rewards=rewards,
             advantages=advantages,
             metadata=metadata,
@@ -313,22 +301,22 @@ class SpeculativeRolloutOrchestrator(RolloutOrchestrator):
 
         padded_ids: list[torch.Tensor] = []
         padded_attention: list[torch.Tensor] = []
-        padded_action: list[torch.Tensor] = []
+        padded_completion: list[torch.Tensor] = []
         padded_policy_lps: list[torch.Tensor] = []
         pad_token_id = int(self.tokenizer.pad_token_id)
 
-        for seq_ids, seq_attention, seq_action, seq_policy_lps in sequences:
+        for seq_ids, seq_attention, seq_completion, seq_policy_lps in sequences:
             pad_amount = max_length - int(seq_ids.numel())
             padded_ids.append(torch.nn.functional.pad(seq_ids, (0, pad_amount), value=pad_token_id))
             padded_attention.append(torch.nn.functional.pad(seq_attention, (0, pad_amount), value=0))
-            padded_action.append(torch.nn.functional.pad(seq_action, (0, pad_amount), value=0))
+            padded_completion.append(torch.nn.functional.pad(seq_completion, (0, pad_amount), value=0))
             padded_policy_lps.append(torch.nn.functional.pad(seq_policy_lps, (0, pad_amount), value=0.0))
 
         shape = (self.config.batch_size, self.config.group_size, max_length)
         return (
             torch.stack(padded_ids, dim=0).to(self.device).view(shape),
             torch.stack(padded_attention, dim=0).to(self.device).view(shape),
-            torch.stack(padded_action, dim=0).to(self.device).view(shape),
+            torch.stack(padded_completion, dim=0).to(self.device).view(shape),
             torch.stack(padded_policy_lps, dim=0).to(self.device).view(shape),
         )
 
@@ -341,38 +329,38 @@ class SpeculativeRolloutOrchestrator(RolloutOrchestrator):
         """Build one full transcript sequence with aligned action-token logprobs."""
 
         ids_parts: list[torch.Tensor] = []
-        action_parts: list[torch.Tensor] = []
+        completion_parts: list[torch.Tensor] = []
         policy_parts: list[torch.Tensor] = []
 
         for index, observation in enumerate(observations):
             for text in ("Observation:\n", observation, "\n\n"):
                 token_ids = self._tokenize_text_ids(text)
                 ids_parts.append(token_ids)
-                action_parts.append(torch.zeros(token_ids.shape[-1], dtype=torch.bool))
+                completion_parts.append(torch.zeros(token_ids.shape[-1], dtype=torch.bool))
                 policy_parts.append(torch.zeros(token_ids.shape[-1], dtype=torch.float32))
 
             if index < len(turn_token_ids):
                 assistant_prefix = self._tokenize_text_ids("Assistant:\n")
                 ids_parts.append(assistant_prefix)
-                action_parts.append(torch.zeros(assistant_prefix.shape[-1], dtype=torch.bool))
+                completion_parts.append(torch.zeros(assistant_prefix.shape[-1], dtype=torch.bool))
                 policy_parts.append(torch.zeros(assistant_prefix.shape[-1], dtype=torch.float32))
 
                 action_ids = turn_token_ids[index].to(dtype=torch.long, device="cpu")
                 action_logprobs = turn_policy_logprobs[index].to(dtype=torch.float32, device="cpu")
                 ids_parts.append(action_ids)
-                action_parts.append(torch.ones(action_ids.shape[-1], dtype=torch.bool))
+                completion_parts.append(torch.ones(action_ids.shape[-1], dtype=torch.bool))
                 policy_parts.append(action_logprobs)
 
                 separator = self._tokenize_text_ids("\n\n")
                 ids_parts.append(separator)
-                action_parts.append(torch.zeros(separator.shape[-1], dtype=torch.bool))
+                completion_parts.append(torch.zeros(separator.shape[-1], dtype=torch.bool))
                 policy_parts.append(torch.zeros(separator.shape[-1], dtype=torch.float32))
 
         input_ids = torch.cat(ids_parts, dim=0)
         attention_mask = torch.ones(input_ids.shape[-1], dtype=torch.long)
-        action_mask = torch.cat(action_parts, dim=0)
+        completion_mask = torch.cat(completion_parts, dim=0)
         policy_logprobs = torch.cat(policy_parts, dim=0)
-        return input_ids, attention_mask, action_mask, policy_logprobs
+        return input_ids, attention_mask, completion_mask, policy_logprobs
 
     def _tokenize_text_ids(self, text: str) -> torch.Tensor:
         """Tokenize a plain-text segment into one-dimensional token ids."""

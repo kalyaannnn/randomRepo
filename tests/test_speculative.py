@@ -135,7 +135,11 @@ def test_speculative_orchestrator_collects_cached_policy_logprobs() -> None:
     assert batch.rewards.tolist() == [[1.0, 1.0]]
     assert batch.metadata["responses"] == [["ab", "ab"]]
     assert batch.metadata["speculative_k"] == 4
-    assert batch.policy_logprobs.abs().sum().item() > 0.0
+    assert batch.old_policy_logprobs.abs().sum().item() > 0.0
+    assert batch.completion_mask.dtype == torch.bool
+    assert batch.completion_mask.any()
+    assert torch.all(batch.old_policy_logprobs[~batch.completion_mask] == 0.0)
+    assert batch.old_policy_logprobs[batch.completion_mask].abs().sum().item() > 0.0
 
 
 def test_trainer_selects_speculative_orchestrator_from_config() -> None:
