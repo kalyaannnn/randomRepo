@@ -4,7 +4,14 @@ import json
 
 import pytest
 
-from examples.byod_task import BYODEnvironment, ExactMatchVerifier, TaskRecord, build_demo_task
+from examples.byod_task import (
+    BYODEnvironment,
+    ExactMatchVerifier,
+    TaskRecord,
+    build_demo_task,
+    build_mbpp_comparison_records,
+    build_mbpp_comparison_task,
+)
 
 
 def test_byod_environment_and_verifier_roundtrip() -> None:
@@ -172,3 +179,34 @@ def test_build_demo_task_wraps_example_records_with_official_api() -> None:
     assert "Return exactly: ok" in prompt
     assert reward == 1.0
     assert samples == [(prompt, "ok")]
+
+
+def test_build_mbpp_comparison_records_returns_prompt_target_metadata(monkeypatch) -> None:
+    rows = [
+        {
+            "task_id": 1,
+            "prompt": "Write a function that returns one.",
+            "code": "def solution():\n    return 1",
+            "test_setup_code": "",
+            "test_list": ["assert solution() == 1"],
+        },
+        {
+            "task_id": 2,
+            "text": "Write a function that returns two.",
+            "code": "def solution():\n    return 2",
+            "test_setup_code": "",
+            "test_list": ["assert solution() == 2"],
+        },
+    ]
+
+    monkeypatch.setattr("examples.byod_task._load_mbpp_rows", lambda limit, seed: rows[:limit])
+
+    records = build_mbpp_comparison_records(limit=2, seed=0)
+    task = build_mbpp_comparison_task(limit=2, seed=0)
+
+    assert len(records) == 2
+    assert "Write Python code" in records[0].input
+    assert records[0].reference_answer == "task::1"
+    assert records[0].supervised_target
+    assert records[0].metadata["task_id"] == 1
+    assert task.supervised_samples()[0][1] == records[0].supervised_target

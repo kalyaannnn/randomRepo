@@ -24,6 +24,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run a fixed AgentRL workload and summarize runtime metrics.",
     )
     parser.add_argument("--model", required=True, help="Transformers model name or local path.")
+    parser.add_argument(
+        "--draft-model",
+        default=None,
+        help="Draft model for optional speculative decoding systems runs.",
+    )
     parser.add_argument("--steps", type=int, default=5, help="Number of benchmarked training steps.")
     parser.add_argument("--batch-size", type=int, default=1, help="Prompts sampled per training step.")
     parser.add_argument("--group-size", type=int, default=4, help="Responses sampled per prompt.")
@@ -61,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Deprecated alias for --compare-runtime-modes.",
     )
+    parser.add_argument(
+        "--include-speculative",
+        action="store_true",
+        help="Also include a speculative decoding AgentRL runtime mode in comparisons.",
+    )
     return parser
 
 
@@ -91,6 +101,8 @@ def _config_hash(config: GRPOConfig, *, task_name: str, split: str) -> str:
 
 
 def _mode_name(config: GRPOConfig) -> str:
+    if config.use_speculative_decoding:
+        return "speculative decoding"
     if not config.use_continuous_batching:
         return "standard rollout"
     if config.use_paged_kv_continuous:
@@ -285,6 +297,7 @@ def _run_one(
     output_dir: Path,
     *,
     use_paged_kv_continuous: bool = False,
+    use_speculative_decoding: bool = False,
 ) -> dict[str, object]:
     """Run one systems benchmark configuration and write its summary."""
 
@@ -299,6 +312,8 @@ def _run_one(
         output_dir=str(output_dir),
         use_continuous_batching=use_continuous_batching,
         use_paged_kv_continuous=use_paged_kv_continuous,
+        use_speculative_decoding=use_speculative_decoding,
+        draft_model_name=args.draft_model if use_speculative_decoding else None,
     )
     environment, verifier = _build_task(args.task, args.split)
     trainer = GRPOTrainer(
@@ -354,16 +369,28 @@ def main() -> None:
             output_dir=output_dir / "paged_kv_continuous",
             use_paged_kv_continuous=True,
         )
+        summaries = [standard_summary, continuous_summary, paged_kv_summary]
+        if args.include_speculative:
+            if not args.draft_model:
+                raise ValueError("--include-speculative requires --draft-model.")
+            summaries.append(
+                _run_one(
+                    args,
+                    use_continuous_batching=False,
+                    output_dir=output_dir / "speculative",
+                    use_speculative_decoding=True,
+                )
+            )
         comparison = {
             "hardware": _hardware_string(),
             "task_name": args.task,
             "split": args.split,
             "model_name": args.model,
-            "runs": [standard_summary, continuous_summary, paged_kv_summary],
-            "comparison_verdict": _comparison_verdict([standard_summary, continuous_summary, paged_kv_summary]),
+            "runs": summaries,
+            "comparison_verdict": _comparison_verdict(summaries),
         }
         (output_dir / "comparison.json").write_text(json.dumps(comparison, indent=2) + "\n", encoding="utf-8")
-        print(_render_comparison_table([standard_summary, continuous_summary, paged_kv_summary]))
+        print(_render_comparison_table(summaries))
         print()
         print(comparison["comparison_verdict"])
         return

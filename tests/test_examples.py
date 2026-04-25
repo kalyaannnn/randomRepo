@@ -9,7 +9,13 @@ from examples.bootstrap_gsm8k_subset import main as bootstrap_gsm8k_main
 from examples.benchmark_gsm8k_subset import main as benchmark_gsm8k_main
 from examples.benchmark_systems import main as benchmark_systems_main
 from examples.eval_gsm8k_subset import main as eval_gsm8k_main
-from examples import benchmark_gsm8k_subset, benchmark_systems, bootstrap_gsm8k_subset, eval_gsm8k_subset, train_math
+from examples import (
+    benchmark_gsm8k_subset,
+    benchmark_systems,
+    bootstrap_gsm8k_subset,
+    eval_gsm8k_subset,
+    train_math,
+)
 from examples.gsm8k_subset import (
     GSM8KProblem,
     GSM8KSubsetEnvironment,
@@ -32,6 +38,151 @@ def test_readme_mentions_official_byod_api() -> None:
         if link.startswith("http"):
             continue
         assert Path(link).is_file(), f"README link does not resolve to a file: {link}"
+
+
+def test_agentrl_single_turn_baseline_main_runs(monkeypatch, tmp_path, capsys) -> None:
+    from examples import agentrl_single_turn_baseline
+
+    captured = {}
+
+    class StubTask:
+        environment = object()
+        verifier = object()
+
+        def supervised_samples(self, tokenizer=None):
+            del tokenizer
+            return [("prompt", "target")]
+
+    class StubTrainer:
+        def __init__(self, config, environment, verifier):
+            captured["config"] = config
+            captured["environment"] = environment
+            captured["verifier"] = verifier
+
+        def train(self):
+            return [{"mean_reward": 0.5, "total_step_time_ms": 10.0, "peak_vram_mb": 64.0}]
+
+    monkeypatch.setattr(agentrl_single_turn_baseline, "build_mbpp_comparison_task", lambda **kwargs: StubTask())
+    monkeypatch.setattr(agentrl_single_turn_baseline, "run_bootstrap", lambda **kwargs: str(tmp_path / "adapter"))
+    monkeypatch.setattr(agentrl_single_turn_baseline, "GRPOTrainer", StubTrainer)
+
+    metrics = agentrl_single_turn_baseline.main(
+        [
+            "--model",
+            "fake/model",
+            "--limit",
+            "4",
+            "--sft-epochs",
+            "1",
+            "--steps",
+            "3",
+            "--batch-size",
+            "1",
+            "--group-size",
+            "4",
+            "--max-new-tokens",
+            "64",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        return_metrics=True,
+    )
+
+    out = capsys.readouterr().out
+    assert '"framework": "agentrl"' in out
+    assert metrics["framework"] == "agentrl"
+    assert metrics["sft_epochs"] == 1
+    assert captured["config"].init_adapter_path == str(tmp_path / "adapter")
+
+
+def test_trl_single_turn_baseline_main_runs(monkeypatch, tmp_path, capsys) -> None:
+    from examples import trl_single_turn_baseline
+
+    class StubTrainer:
+        def __init__(self, *args, **kwargs):
+            self.model = "trained-model"
+
+        def train(self):
+            return SimpleNamespace(metrics={"train_runtime": 1.25})
+
+    monkeypatch.setattr(
+        trl_single_turn_baseline,
+        "build_mbpp_comparison_dataset",
+        lambda **kwargs: {
+            "sft": [{"prompt": "p", "completion": "c"}],
+            "rl": [{"prompt": "p"}],
+            "reward_fn": lambda *args, **kwargs: [1.0],
+        },
+    )
+    monkeypatch.setattr(trl_single_turn_baseline, "SFTTrainer", StubTrainer)
+    monkeypatch.setattr(trl_single_turn_baseline, "GRPOTrainer", StubTrainer)
+    monkeypatch.setattr(trl_single_turn_baseline, "SFTConfig", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(trl_single_turn_baseline, "GRPOConfig", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    metrics = trl_single_turn_baseline.main(
+        [
+            "--model",
+            "fake/model",
+            "--limit",
+            "4",
+            "--sft-epochs",
+            "1",
+            "--steps",
+            "3",
+            "--batch-size",
+            "1",
+            "--group-size",
+            "4",
+            "--max-new-tokens",
+            "64",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        return_metrics=True,
+    )
+
+    out = capsys.readouterr().out
+    assert '"framework": "trl"' in out
+    assert metrics["framework"] == "trl"
+    assert metrics["quality_metric"] == "mean_reward"
+
+
+def test_compare_single_turn_baselines_writes_summary(monkeypatch, tmp_path) -> None:
+    from examples import compare_single_turn_baselines
+
+    monkeypatch.setattr(
+        compare_single_turn_baselines,
+        "run_agentrl",
+        lambda args: {"framework": "agentrl", "quality_metric": "mean_reward", "mean_reward": 0.6},
+    )
+    monkeypatch.setattr(
+        compare_single_turn_baselines,
+        "run_trl",
+        lambda args: {"framework": "trl", "quality_metric": "mean_reward", "mean_reward": 0.55},
+    )
+
+    comparison = compare_single_turn_baselines.main(
+        ["--model", "fake/model", "--output-dir", str(tmp_path)],
+        return_metrics=True,
+    )
+
+    summary = (tmp_path / "comparison.json").read_text(encoding="utf-8")
+    assert '"framework": "agentrl"' in summary
+    assert '"framework": "trl"' in summary
+    assert comparison["agentrl"]["mean_reward"] == 0.6
+
+
+def test_build_colab_single_turn_demo_writes_notebook(tmp_path) -> None:
+    from examples.build_colab_single_turn_demo import main
+
+    notebook_path = tmp_path / "agentrl_trl_15b_t4_demo.ipynb"
+
+    main(["--output", str(notebook_path)])
+
+    text = notebook_path.read_text(encoding="utf-8")
+    assert "Qwen/Qwen2.5-1.5B-Instruct" in text
+    assert "compare_single_turn_baselines" in text
+    assert "SFT bootstrap" in text
 
 
 def test_math_environment_and_verifier_roundtrip() -> None:
@@ -802,6 +953,72 @@ def test_benchmark_systems_writes_comparison_verdict(monkeypatch, tmp_path) -> N
     assert '"mode_name": "continuous batching"' in comparison
     assert '"mode_name": "paged-kv continuous batching"' in comparison
     assert '"comparison_verdict": "Fastest overall: paged-kv continuous batching (70.00 ms mean step time, paged-kv-limited). Slowest overall: standard rollout (100.00 ms). Paged-KV continuous batching was 10.00 ms faster than legacy continuous batching (70.00 ms vs 80.00 ms)."' in comparison
+
+
+def test_benchmark_systems_can_include_speculative_mode(monkeypatch, tmp_path) -> None:
+    captured_configs = []
+
+    class StubTrainer:
+        def __init__(self, config, environment, verifier):
+            del environment, verifier
+            self.config = config
+            captured_configs.append(config)
+
+        def train(self):
+            return [
+                {
+                    "total_step_time_ms": 75.0 if self.config.use_speculative_decoding else 100.0,
+                    "generation_time_ms": 45.0,
+                    "training_time_ms": 30.0,
+                    "tokens_per_second": 32.0,
+                    "prefill_tokens_per_second": 24.0,
+                    "decode_tokens_per_second": 20.0,
+                    "padding_ratio": 0.1,
+                    "generation_padding_ratio": 0.1,
+                    "sequence_padding_ratio": 0.05,
+                    "cache_reuse_effectiveness": 0.6,
+                    "peak_vram_mb": 118.0,
+                    "rollout_peak_vram_mb": 108.0,
+                    "rollout_runtime_headroom_mb": 520.0,
+                    "runtime_adjustments": 0.0,
+                    "runtime_low_headroom": 0.0,
+                    "dominant_runtime_bottleneck": "decode",
+                    "runtime_recommendation": "Decode dominates.",
+                    "last_runtime_adjustment_reason": "none",
+                }
+            ]
+
+    monkeypatch.setattr(benchmark_systems, "GRPOTrainer", StubTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_systems.py",
+            "--model",
+            "fake/model",
+            "--draft-model",
+            "fake/draft",
+            "--steps",
+            "1",
+            "--batch-size",
+            "1",
+            "--group-size",
+            "4",
+            "--max-new-tokens",
+            "16",
+            "--output-dir",
+            str(tmp_path / "systems_speculative"),
+            "--compare-runtime-modes",
+            "--include-speculative",
+        ],
+    )
+
+    benchmark_systems_main()
+
+    comparison = (tmp_path / "systems_speculative" / "comparison.json").read_text(encoding="utf-8")
+    assert '"mode_name": "speculative decoding"' in comparison
+    assert any(config.use_speculative_decoding for config in captured_configs)
+    assert any(config.draft_model_name == "fake/draft" for config in captured_configs)
 
 
 def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:
