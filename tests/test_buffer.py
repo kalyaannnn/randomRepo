@@ -13,9 +13,8 @@ def make_batch() -> RolloutBatch:
     return RolloutBatch(
         input_ids=torch.tensor([[[1, 2, 3], [4, 5, 6]]], dtype=torch.long),
         attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-        policy_logprobs=torch.tensor([[[0.0, -0.1, -0.2], [0.0, -0.3, -0.4]]], dtype=torch.float32),
-        ref_logprobs=torch.tensor([[[0.0, -0.2, -0.3], [0.0, -0.4, -0.5]]], dtype=torch.float32),
+        completion_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
+        old_policy_logprobs=torch.tensor([[[0.0, -0.1, -0.2], [0.0, -0.3, -0.4]]], dtype=torch.float32),
         rewards=torch.tensor([[1.0, 0.25]], dtype=torch.float32),
         advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
         metadata={"responses": [["good", "bad"]]},
@@ -42,10 +41,9 @@ def test_buffer_save_uses_compact_dtypes_and_roundtrips(tmp_path: Path) -> None:
 
     assert path.name == "trajectory_000012.pt"
     assert payload["input_ids"].dtype == torch.int16
-    assert payload["policy_logprobs"].dtype == torch.float16
-    assert payload["ref_logprobs"].dtype == torch.float16
+    assert payload["old_policy_logprobs"].dtype == torch.float16
     assert loaded.input_ids.dtype == torch.long
-    assert loaded.policy_logprobs.dtype == torch.float32
+    assert loaded.old_policy_logprobs.dtype == torch.float32
     assert loaded.metadata == batch.metadata
     assert torch.equal(loaded.rewards, batch.rewards)
 
@@ -56,9 +54,8 @@ def test_buffer_uses_int32_when_token_ids_exceed_int16_range(tmp_path: Path) -> 
     batch = RolloutBatch(
         input_ids=batch.input_ids + 70000,
         attention_mask=batch.attention_mask,
-        action_mask=batch.action_mask,
-        policy_logprobs=batch.policy_logprobs,
-        ref_logprobs=batch.ref_logprobs,
+        completion_mask=batch.completion_mask,
+        old_policy_logprobs=batch.old_policy_logprobs,
         rewards=batch.rewards,
         advantages=batch.advantages,
         metadata=batch.metadata,
@@ -77,9 +74,8 @@ def test_buffer_filter_and_size_bytes_include_saved_trajectories(tmp_path: Path)
     bad_batch = RolloutBatch(
         input_ids=good_batch.input_ids.clone(),
         attention_mask=good_batch.attention_mask.clone(),
-        action_mask=good_batch.action_mask.clone(),
-        policy_logprobs=good_batch.policy_logprobs.clone(),
-        ref_logprobs=good_batch.ref_logprobs.clone(),
+        completion_mask=good_batch.completion_mask.clone(),
+        old_policy_logprobs=good_batch.old_policy_logprobs.clone(),
         rewards=torch.tensor([[0.1, 0.2]], dtype=torch.float32),
         advantages=good_batch.advantages.clone(),
         metadata={"responses": [["low", "lower"]]},

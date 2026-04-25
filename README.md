@@ -11,7 +11,7 @@ Single-GPU rollout/runtime and post-training stack for verifier-based RL: contin
 | Area | Contents |
 |------|----------|
 | Runtime | Standard and continuous batching, chunked prefill, persistent-KV decode where supported, controller signals, bottleneck tooling |
-| Training | Reference GRPO path, verifier-driven reward, adapter reuse and checkpointing |
+| Training | TRL-compatible clipped GRPO path, verifier-driven reward, adapter reuse and checkpointing |
 | Tasks | Dataset/verifier/environment not tied to one benchmark; full control via `BaseEnvironment` / `BaseVerifier`, or high-level BYOD (`BYODRecord`, `make_single_turn_task`) for single-turn `prompt → response → verify` flows |
 
 Custom tasks extend `BaseEnvironment.reset`, `step`, `state`, and `BaseVerifier.verify(response, env_state)`.
@@ -92,9 +92,6 @@ This compares:
 and preserves both systems metrics and task reward so the runtime comparison
 stays grounded in a real multi-turn workload.
 
-## Validation snapshot (MBPP BYOD, execution verifier, single small run)
-
-Not a benchmark claim: one code-task demo showed continuous vs standard rollout at roughly **1.54x faster per step**, **1.55x higher throughput**, **2842 MB less rollout VRAM**, and **+0.158** mean reward vs standard in that configuration.
 
 ## Out of scope (current open-source shape)
 

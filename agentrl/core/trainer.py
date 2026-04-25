@@ -43,6 +43,130 @@ class StepMetrics:
     unique_response_ratio: float
 
 
+@dataclass(slots=True)
+class GRPOObjectiveStats:
+    """Structured outputs from the sampled-token GRPO objective."""
+
+    policy_loss_tensor: torch.Tensor
+    kl_loss_tensor: torch.Tensor
+    total_loss_tensor: torch.Tensor
+    mean_ratio: float
+    mean_token_kl: float
+    clip_ratio_region_mean: float
+    clip_ratio_low_mean: float
+    clip_ratio_high_mean: float
+
+    @property
+    def policy_loss(self) -> float:
+        return float(self.policy_loss_tensor.detach().item())
+
+    @property
+    def kl_loss(self) -> float:
+        return float(self.kl_loss_tensor.detach().item())
+
+    @property
+    def total_loss(self) -> float:
+        return float(self.total_loss_tensor.detach().item())
+
+
+def _gather_sampled_token_logprobs(
+    input_ids: torch.Tensor,
+    logits: torch.Tensor,
+) -> torch.Tensor:
+    """Gather logprobs for the sampled next-token actions."""
+
+    token_logprobs = torch.log_softmax(logits[:, :-1, :], dim=-1)
+    targets = input_ids[:, 1:].unsqueeze(-1)
+    return token_logprobs.gather(dim=-1, index=targets).squeeze(-1)
+
+
+def _compute_logprob_ratio(
+    current_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    clip_range: float,
+) -> torch.Tensor:
+    """Compute a clipped importance ratio from current-vs-old logprobs."""
+
+    logprob_delta = (current_logprobs - old_logprobs).clamp(min=-clip_range, max=clip_range)
+    return logprob_delta.exp()
+
+
+def _compute_sampled_token_kl(
+    current_logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,
+) -> torch.Tensor:
+    """Approximate sampled-token KL with the TRL-style per-token estimator."""
+
+    logprob_delta = ref_logprobs - current_logprobs
+    return logprob_delta.exp() - logprob_delta - 1.0
+
+
+def _masked_token_mean(values: torch.Tensor, sampled_token_mask: torch.Tensor) -> torch.Tensor:
+    """Average values across active sampled completion tokens only."""
+
+    mask = sampled_token_mask.to(dtype=values.dtype)
+    token_count = mask.sum().clamp(min=1.0)
+    return (values * mask).sum() / token_count
+
+
+def _compute_clipped_grpo_objective(
+    current_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    sampled_token_mask: torch.Tensor,
+    epsilon: float,
+    beta: float,
+    ref_logprobs: torch.Tensor | None,
+    clip_range: float,
+) -> GRPOObjectiveStats:
+    """Compute the sampled-token clipped GRPO objective and parity metrics."""
+
+    broadcast_advantages = advantages.to(
+        device=current_logprobs.device,
+        dtype=current_logprobs.dtype,
+    ).unsqueeze(-1).expand_as(current_logprobs)
+    ratios = _compute_logprob_ratio(current_logprobs, old_logprobs, clip_range=clip_range)
+    clipped_ratios = ratios.clamp(min=1.0 - epsilon, max=1.0 + epsilon)
+
+    unclipped_surrogate = ratios * broadcast_advantages
+    clipped_surrogate = clipped_ratios * broadcast_advantages
+    policy_terms = -torch.minimum(unclipped_surrogate, clipped_surrogate)
+    policy_loss = _masked_token_mean(policy_terms, sampled_token_mask)
+
+    if beta > 0.0:
+        if ref_logprobs is None:
+            raise ValueError("ref_logprobs is required when beta > 0.0.")
+        token_kl = _compute_sampled_token_kl(current_logprobs, ref_logprobs)
+        mean_token_kl_tensor = _masked_token_mean(token_kl, sampled_token_mask)
+        kl_loss = policy_loss.new_tensor(beta) * mean_token_kl_tensor
+    else:
+        token_kl = torch.zeros_like(current_logprobs)
+        mean_token_kl_tensor = policy_loss.new_zeros(())
+        kl_loss = policy_loss.new_zeros(())
+
+    total_loss = policy_loss + kl_loss
+    low_clip = ratios < (1.0 - epsilon)
+    high_clip = ratios > (1.0 + epsilon)
+    clip_region = low_clip | high_clip
+
+    return GRPOObjectiveStats(
+        policy_loss_tensor=policy_loss,
+        kl_loss_tensor=kl_loss,
+        total_loss_tensor=total_loss,
+        mean_ratio=float(_masked_token_mean(ratios, sampled_token_mask).detach().item()),
+        mean_token_kl=float(mean_token_kl_tensor.detach().item()),
+        clip_ratio_region_mean=float(
+            _masked_token_mean(clip_region.to(dtype=current_logprobs.dtype), sampled_token_mask).detach().item()
+        ),
+        clip_ratio_low_mean=float(
+            _masked_token_mean(low_clip.to(dtype=current_logprobs.dtype), sampled_token_mask).detach().item()
+        ),
+        clip_ratio_high_mean=float(
+            _masked_token_mean(high_clip.to(dtype=current_logprobs.dtype), sampled_token_mask).detach().item()
+        ),
+    )
+
+
 class GRPOTrainer:
     """Main entrypoint for rollout collection and GRPO optimization."""
 
@@ -72,11 +196,7 @@ class GRPOTrainer:
         self._maybe_compile_model()
         self._maybe_autoconfigure_chunk_size()
         self.runtime_controller = ExecutionController(config=self.config, device=self.device)
-
-        if self.config.use_gradient_checkpointing:
-            gradient_checkpointing_enable = getattr(self.layout.model, "gradient_checkpointing_enable", None)
-            if gradient_checkpointing_enable is not None:
-                gradient_checkpointing_enable()
+        self.gradient_checkpointing_enabled = self._maybe_enable_gradient_checkpointing()
 
         self.rollout = rollout_orchestrator or self._build_rollout_orchestrator(draft_model=draft_model)
         self.metrics_logger = metrics_logger or MetricsLogger(
@@ -144,7 +264,7 @@ class GRPOTrainer:
                     self.trajectory_buffer.save(step)
 
                 system_metrics = prof.metrics()
-                effective_batch_tokens = float(batch.action_mask.sum().item())
+                effective_batch_tokens = float(batch.completion_mask.sum().item())
                 total_ms = max(system_metrics.get("total_step_time_ms", 0.0), 1e-6)
                 system_metrics["effective_batch_tokens"] = effective_batch_tokens
                 system_metrics["tokens_per_second"] = effective_batch_tokens / (total_ms / 1000.0)
@@ -297,7 +417,7 @@ class GRPOTrainer:
 
         flat_input_ids = batch.input_ids.view(-1, batch.input_ids.shape[-1])
         flat_attention_mask = batch.attention_mask.view(-1, batch.attention_mask.shape[-1])
-        flat_action_mask = batch.action_mask.view(-1, batch.action_mask.shape[-1])
+        flat_completion_mask = batch.completion_mask.view(-1, batch.completion_mask.shape[-1])
         flat_advantages = batch.advantages.reshape(-1)
 
         autocast_context = self._autocast_context()
@@ -307,27 +427,34 @@ class GRPOTrainer:
                 input_ids=flat_input_ids,
                 attention_mask=flat_attention_mask,
             )
-            with torch.no_grad():
-                ref_logits = self.layout.reference_forward(
-                    input_ids=flat_input_ids,
-                    attention_mask=flat_attention_mask,
-                )
-
-            token_logprobs, token_ref_logprobs, token_kl = self._token_statistics(
-                flat_input_ids,
-                policy_logits,
-                ref_logits,
+            current_logprobs = _gather_sampled_token_logprobs(flat_input_ids, policy_logits)
+            old_logprobs = batch.old_policy_logprobs.view(-1, batch.old_policy_logprobs.shape[-1])[:, 1:].to(
+                device=current_logprobs.device,
+                dtype=current_logprobs.dtype,
             )
-            masked_action = flat_action_mask[:, 1:].to(dtype=policy_logits.dtype)
-            sequence_delta = ((token_logprobs - token_ref_logprobs) * masked_action).sum(dim=-1)
-            action_token_count = masked_action.sum().clamp(min=1.0)
-            mean_token_kl = (token_kl * masked_action).sum() / action_token_count
+            sampled_token_mask = flat_completion_mask[:, 1:]
 
-            policy_loss = -(flat_advantages * sequence_delta).mean()
-            kl_loss = self.current_beta * mean_token_kl
-            total_loss = policy_loss + kl_loss
+            ref_logprobs = None
+            if self.current_beta > 0.0:
+                with torch.no_grad():
+                    ref_logits = self.layout.reference_forward(
+                        input_ids=flat_input_ids,
+                        attention_mask=flat_attention_mask,
+                    )
+                ref_logprobs = _gather_sampled_token_logprobs(flat_input_ids, ref_logits)
 
-        scaled_loss = total_loss / float(self.config.gradient_accumulation_steps)
+            objective = _compute_clipped_grpo_objective(
+                current_logprobs=current_logprobs,
+                old_logprobs=old_logprobs,
+                advantages=flat_advantages,
+                sampled_token_mask=sampled_token_mask,
+                epsilon=self.config.epsilon,
+                beta=self.current_beta,
+                ref_logprobs=ref_logprobs,
+                clip_range=self.config.clip_range,
+            )
+
+        scaled_loss = objective.total_loss_tensor / float(self.config.gradient_accumulation_steps)
         scaled_loss.backward()
 
         if perform_optimizer_step:
@@ -335,53 +462,34 @@ class GRPOTrainer:
             self.optimizer.step()
             if self.scheduler is not None:
                 self.scheduler.step()
-            if self.config.use_adaptive_kl:
-                self._update_beta(float(mean_token_kl.detach().item()))
 
-        metrics = self._build_metrics(batch, policy_loss, kl_loss, total_loss, mean_token_kl)
+        metrics = self._build_metrics(batch, objective)
         metrics["learning_rate"] = current_lr
         metrics["beta"] = self.current_beta
         self._log_degenerate_batch_warnings(batch, metrics)
-        return total_loss.detach(), metrics
-
-    def _token_statistics(
-        self,
-        input_ids: torch.Tensor,
-        policy_logits: torch.Tensor,
-        ref_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute token logprobs and analytical per-token KL."""
-
-        policy_logprobs = torch.log_softmax(policy_logits[:, :-1, :], dim=-1)
-        ref_logprobs = torch.log_softmax(ref_logits[:, :-1, :], dim=-1)
-        targets = input_ids[:, 1:].unsqueeze(-1)
-        gathered_policy = policy_logprobs.gather(dim=-1, index=targets).squeeze(-1)
-        gathered_ref = ref_logprobs.gather(dim=-1, index=targets).squeeze(-1)
-
-        policy_probs = policy_logprobs.exp()
-        token_kl = (policy_probs * (policy_logprobs - ref_logprobs)).sum(dim=-1)
-        return gathered_policy, gathered_ref, token_kl
+        return objective.total_loss_tensor.detach(), metrics
 
     def _build_metrics(
         self,
         batch: RolloutBatch,
-        policy_loss: torch.Tensor,
-        kl_loss: torch.Tensor,
-        total_loss: torch.Tensor,
-        mean_token_kl: torch.Tensor,
+        objective: GRPOObjectiveStats,
     ) -> dict[str, float]:
         """Collect scalar metrics required by the GRPO contract."""
 
         return {
             "mean_reward": float(batch.rewards.mean().item()),
             "reward_std": float(batch.rewards.std(unbiased=False).item()),
-            "policy_loss": float(policy_loss.detach().item()),
-            "kl_loss": float(kl_loss.detach().item()),
-            "mean_token_kl": float(mean_token_kl.detach().item()),
-            "total_loss": float(total_loss.detach().item()),
+            "policy_loss": objective.policy_loss,
+            "kl_loss": objective.kl_loss,
+            "mean_token_kl": objective.mean_token_kl,
+            "total_loss": objective.total_loss,
             "advantage_mean": float(batch.advantages.mean().item()),
             "advantage_std": float(batch.advantages.std(unbiased=False).item()),
             "unique_response_ratio": float(batch.metadata.get("unique_response_ratio", 0.0)),
+            "clip_ratio/region_mean": objective.clip_ratio_region_mean,
+            "clip_ratio/low_mean": objective.clip_ratio_low_mean,
+            "clip_ratio/high_mean": objective.clip_ratio_high_mean,
+            "mean_ratio": objective.mean_ratio,
         }
 
     def _build_lr_scheduler(self):
@@ -425,16 +533,6 @@ class GRPOTrainer:
         """Return the active optimizer learning rate."""
 
         return float(self.optimizer.param_groups[0]["lr"])
-
-    def _update_beta(self, mean_token_kl: float) -> None:
-        """Apply a bounded multiplicative update toward the configured KL target."""
-
-        if self.config.kl_target is None:
-            return
-        if mean_token_kl > self.config.kl_target:
-            self.current_beta = min(self.current_beta * self.config.kl_beta_multiplier, self.config.max_beta)
-        elif mean_token_kl < self.config.kl_target:
-            self.current_beta = max(self.current_beta / self.config.kl_beta_multiplier, self.config.min_beta)
 
     def _run_profiled_step(self, step: int, profiler: SystemsProfiler, should_step: bool) -> None:
         """Run one train step, optionally exporting a torch profiler trace."""
@@ -695,6 +793,8 @@ class GRPOTrainer:
         report: dict[str, float | str | None] = {
             "device": self.device.type,
             "device_name": str(self.device),
+            "gradient_checkpointing_requested": self.config.use_gradient_checkpointing,
+            "gradient_checkpointing_enabled": self.gradient_checkpointing_enabled,
         }
 
         vram_report = getattr(self.layout, "vram_report", None)
@@ -731,6 +831,55 @@ class GRPOTrainer:
         model_config = getattr(self.layout.model, "config", None)
         report.update(self.runtime_controller.build_preflight_report(report, model_config))
         return report
+
+    def _maybe_enable_gradient_checkpointing(self) -> bool:
+        """Enable gradient checkpointing and input-gradient hooks when supported."""
+
+        if not self.config.use_gradient_checkpointing:
+            return False
+
+        enabled = False
+        input_grads_enabled = False
+        seen: set[int] = set()
+        model_candidates = [
+            getattr(self.layout, "model", None),
+            getattr(getattr(self.layout, "model", None), "model", None),
+            getattr(getattr(self.layout, "model", None), "base_model", None),
+        ]
+
+        get_base_model = getattr(getattr(self.layout, "model", None), "get_base_model", None)
+        if callable(get_base_model):
+            try:
+                model_candidates.append(get_base_model())
+            except Exception:  # pragma: no cover - defensive around HF/PEFT wrappers
+                LOGGER.debug("get_base_model() failed while enabling gradient checkpointing.", exc_info=True)
+
+        for candidate in model_candidates:
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+
+            enable_input_require_grads = getattr(candidate, "enable_input_require_grads", None)
+            if callable(enable_input_require_grads):
+                enable_input_require_grads()
+                input_grads_enabled = True
+
+            gradient_checkpointing_enable = getattr(candidate, "gradient_checkpointing_enable", None)
+            if callable(gradient_checkpointing_enable):
+                gradient_checkpointing_enable()
+                enabled = True
+
+        if self.config.use_gradient_checkpointing and not enabled:
+            LOGGER.warning(
+                "use_gradient_checkpointing=True but the loaded model does not expose "
+                "gradient_checkpointing_enable()."
+            )
+        elif enabled:
+            LOGGER.info(
+                "gradient checkpointing enabled%s",
+                " with input gradient hooks" if input_grads_enabled else "",
+            )
+        return enabled
 
     def _log_startup_report(self) -> None:
         """Emit a concise startup device and memory summary."""

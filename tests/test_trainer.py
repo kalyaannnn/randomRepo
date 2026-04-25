@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 
+import pytest
 import torch
 
 from agentrl.core.base import BaseEnvironment, BaseVerifier
@@ -42,6 +45,7 @@ class TrainableLayout:
         self.logit_scale = torch.nn.Parameter(torch.tensor(0.0))
         self.ref_bias = 0.25
         self.saved_adapters = []
+        self.reference_forward_calls = 0
 
     def trainable_parameters(self):
         yield self.logit_scale
@@ -56,6 +60,7 @@ class TrainableLayout:
 
     def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         del attention_mask
+        self.reference_forward_calls += 1
         batch, seq = input_ids.shape
         vocab = 4
         logits = torch.zeros((batch, seq, vocab), dtype=torch.float32)
@@ -93,6 +98,47 @@ class ClosingLogger:
         self.closed = True
 
 
+class RecordingTrajectoryBuffer:
+    def __init__(self) -> None:
+        self.added_steps: list[int] = []
+        self.saved_steps: list[int] = []
+
+    def add(self, batch: RolloutBatch, step: int) -> None:
+        del batch
+        self.added_steps.append(step)
+
+    def save(self, step: int) -> None:
+        self.saved_steps.append(step)
+
+
+def make_batch(group_size: int = 2) -> RolloutBatch:
+    input_rows = [[0, 1, 1], [0, 1, 2]]
+    reward_row = [1.0, 0.0]
+    advantage_row = [1.0, -1.0]
+    response_row = ["x", "y"]
+    if group_size == 4:
+        input_rows = [[0, 1, 1], [0, 1, 2], [0, 1, 1], [0, 1, 2]]
+        reward_row = [1.0, 0.0, 1.0, 0.0]
+        advantage_row = [1.0, -1.0, 1.0, -1.0]
+        response_row = ["x", "y", "x", "y"]
+
+    input_ids = torch.tensor([input_rows], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    completion_mask = torch.tensor(
+        [[[0, 1, 1] for _ in range(group_size)]],
+        dtype=torch.bool,
+    )
+    return RolloutBatch(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        completion_mask=completion_mask,
+        old_policy_logprobs=torch.zeros_like(input_ids, dtype=torch.float32),
+        rewards=torch.tensor([reward_row], dtype=torch.float32),
+        advantages=torch.tensor([advantage_row], dtype=torch.float32),
+        metadata={"unique_response_ratio": 1.0, "responses": [response_row]},
+    )
+
+
 def test_trainer_step_updates_trainable_parameter() -> None:
     config = GRPOConfig(
         model_name="fake/model",
@@ -101,16 +147,7 @@ def test_trainer_step_updates_trainable_parameter() -> None:
         steps=1,
         max_new_tokens=4,
     )
-    batch = RolloutBatch(
-        input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2]]], dtype=torch.long),
-        attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-        policy_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        ref_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-        advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
-        metadata={"unique_response_ratio": 1.0, "responses": [["x", "y"]]},
-    )
+    batch = make_batch()
     layout = TrainableLayout()
     trainer = GRPOTrainer(
         config=config,
@@ -142,16 +179,7 @@ def test_trainer_closes_metrics_logger_after_train() -> None:
         steps=1,
         use_continuous_batching=False,
     )
-    batch = RolloutBatch(
-        input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2]]], dtype=torch.long),
-        attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-        policy_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        ref_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-        advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
-        metadata={"unique_response_ratio": 1.0, "responses": [["x", "y"]]},
-    )
+    batch = make_batch()
     logger = ClosingLogger()
     trainer = GRPOTrainer(
         config=config,
@@ -161,6 +189,7 @@ def test_trainer_closes_metrics_logger_after_train() -> None:
         layout=TrainableLayout(),
         rollout_orchestrator=StaticRollout(batch),
         metrics_logger=logger,
+        trajectory_buffer=RecordingTrajectoryBuffer(),
     )
 
     trainer.train()
@@ -184,16 +213,7 @@ def test_trainer_saves_periodic_and_final_adapters(tmp_path) -> None:
         output_dir=str(tmp_path),
         use_continuous_batching=False,
     )
-    batch = RolloutBatch(
-        input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2]]], dtype=torch.long),
-        attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-        policy_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        ref_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-        advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
-        metadata={"unique_response_ratio": 1.0, "responses": [["x", "y"]]},
-    )
+    batch = make_batch()
     layout = TrainableLayout()
     trainer = GRPOTrainer(
         config=config,
@@ -203,6 +223,7 @@ def test_trainer_saves_periodic_and_final_adapters(tmp_path) -> None:
         layout=layout,
         rollout_orchestrator=StaticRollout(batch),
         metrics_logger=ClosingLogger(),
+        trajectory_buffer=RecordingTrajectoryBuffer(),
     )
 
     trainer.train()
@@ -229,23 +250,49 @@ def test_trainer_exposes_startup_vram_report() -> None:
         verifier=MinimalVerifier(),
         tokenizer=DummyTokenizer(),
         layout=TrainableLayout(),
-        rollout_orchestrator=StaticRollout(
-            RolloutBatch(
-                input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2]]], dtype=torch.long),
-                attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-                action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-                policy_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-                ref_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-                rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-                advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
-                metadata={"unique_response_ratio": 1.0, "responses": [["x", "y"]]},
-            )
-        ),
+        rollout_orchestrator=StaticRollout(make_batch()),
     )
 
     assert trainer.startup_report["device"] == "cpu"
     assert trainer.startup_report["parameter_total_mb"] == 11.5
     assert trainer.startup_report["runtime_headroom_mb"] is None
+
+
+def test_trainer_enables_gradient_checkpointing_hooks() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        steps=1,
+        use_gradient_checkpointing=True,
+        device="cpu",
+    )
+    layout = TrainableLayout()
+    flags = {"checkpointing": 0, "input_grads": 0}
+
+    def _enable_checkpointing():
+        flags["checkpointing"] += 1
+
+    def _enable_input_grads():
+        flags["input_grads"] += 1
+
+    layout.model.gradient_checkpointing_enable = _enable_checkpointing
+    layout.model.enable_input_require_grads = _enable_input_grads
+
+    trainer = GRPOTrainer(
+        config=config,
+        environment=MinimalEnvironment(),
+        verifier=MinimalVerifier(),
+        tokenizer=DummyTokenizer(),
+        layout=layout,
+        rollout_orchestrator=StaticRollout(make_batch()),
+    )
+
+    assert flags["checkpointing"] == 1
+    assert flags["input_grads"] == 1
+    assert trainer.gradient_checkpointing_enabled is True
+    assert trainer.startup_report["gradient_checkpointing_requested"] is True
+    assert trainer.startup_report["gradient_checkpointing_enabled"] is True
 
 
 def test_trainer_creates_profile_trace(tmp_path) -> None:
@@ -258,16 +305,7 @@ def test_trainer_creates_profile_trace(tmp_path) -> None:
         profile_steps=1,
         profile_dir=str(tmp_path / "profiles"),
     )
-    batch = RolloutBatch(
-        input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2]]], dtype=torch.long),
-        attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-        policy_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        ref_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-        advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
-        metadata={"unique_response_ratio": 1.0, "responses": [["x", "y"]]},
-    )
+    batch = make_batch()
     logger = ClosingLogger()
     trainer = GRPOTrainer(
         config=config,
@@ -277,6 +315,7 @@ def test_trainer_creates_profile_trace(tmp_path) -> None:
         layout=TrainableLayout(),
         rollout_orchestrator=StaticRollout(batch),
         metrics_logger=logger,
+        trajectory_buffer=RecordingTrajectoryBuffer(),
     )
 
     trainer.train()
@@ -308,16 +347,7 @@ def test_trainer_retries_after_rollout_oom() -> None:
         use_continuous_batching=True,
         oom_retry_budget=1,
     )
-    batch = RolloutBatch(
-        input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2], [0, 1, 1], [0, 1, 2]]], dtype=torch.long),
-        attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1], [0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-        policy_logprobs=torch.zeros((1, 4, 3), dtype=torch.float32),
-        ref_logprobs=torch.zeros((1, 4, 3), dtype=torch.float32),
-        rewards=torch.tensor([[1.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
-        advantages=torch.tensor([[1.0, -1.0, 1.0, -1.0]], dtype=torch.float32),
-        metadata={"unique_response_ratio": 1.0, "responses": [["x", "y", "x", "y"]]},
-    )
+    batch = make_batch(group_size=4)
     rollout = OOMThenSuccessRollout(config=config, batch=batch)
     trainer = GRPOTrainer(
         config=config,
@@ -327,6 +357,7 @@ def test_trainer_retries_after_rollout_oom() -> None:
         layout=TrainableLayout(),
         rollout_orchestrator=rollout,
         metrics_logger=ClosingLogger(),
+        trajectory_buffer=RecordingTrajectoryBuffer(),
     )
 
     trainer.train()
@@ -335,7 +366,7 @@ def test_trainer_retries_after_rollout_oom() -> None:
     assert config.chunk_size == 2
 
 
-def test_trainer_logs_scheduler_and_adaptive_beta(tmp_path) -> None:
+def test_trainer_logs_scheduler_and_static_beta() -> None:
     config = GRPOConfig(
         model_name="fake/model",
         batch_size=1,
@@ -345,21 +376,8 @@ def test_trainer_logs_scheduler_and_adaptive_beta(tmp_path) -> None:
         lr=1e-3,
         lr_scheduler="cosine",
         min_lr_ratio=0.5,
-        use_adaptive_kl=True,
-        kl_target=1e-6,
-        kl_beta_multiplier=2.0,
-        max_beta=1.0,
     )
-    batch = RolloutBatch(
-        input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2]]], dtype=torch.long),
-        attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-        policy_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        ref_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-        rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-        advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
-        metadata={"unique_response_ratio": 1.0, "responses": [["x", "y"]]},
-    )
+    batch = make_batch()
     logger = ClosingLogger()
     trainer = GRPOTrainer(
         config=config,
@@ -369,6 +387,7 @@ def test_trainer_logs_scheduler_and_adaptive_beta(tmp_path) -> None:
         layout=TrainableLayout(),
         rollout_orchestrator=StaticRollout(batch),
         metrics_logger=logger,
+        trajectory_buffer=RecordingTrajectoryBuffer(),
     )
 
     trainer.train()
@@ -377,9 +396,59 @@ def test_trainer_logs_scheduler_and_adaptive_beta(tmp_path) -> None:
     second_metrics = logger.rows[1][1]
     assert first_metrics["learning_rate"] == config.lr
     assert second_metrics["learning_rate"] < config.lr
-    assert first_metrics["beta"] > config.beta
-    assert second_metrics["beta"] >= first_metrics["beta"]
+    assert first_metrics["beta"] == config.beta
+    assert second_metrics["beta"] == config.beta
     assert "mean_token_kl" in second_metrics
+
+
+def test_trainer_skips_reference_forward_when_beta_is_zero() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        steps=1,
+        beta=0.0,
+    )
+    layout = TrainableLayout()
+    trainer = GRPOTrainer(
+        config=config,
+        environment=MinimalEnvironment(),
+        verifier=MinimalVerifier(),
+        tokenizer=DummyTokenizer(),
+        layout=layout,
+        rollout_orchestrator=StaticRollout(make_batch()),
+    )
+
+    _, metrics = trainer.step(make_batch())
+
+    assert layout.reference_forward_calls == 0
+    assert metrics["mean_token_kl"] == 0.0
+    assert metrics["kl_loss"] == 0.0
+
+
+def test_trainer_logs_clip_metrics() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        steps=1,
+        beta=0.0,
+    )
+    trainer = GRPOTrainer(
+        config=config,
+        environment=MinimalEnvironment(),
+        verifier=MinimalVerifier(),
+        tokenizer=DummyTokenizer(),
+        layout=TrainableLayout(),
+        rollout_orchestrator=StaticRollout(make_batch()),
+    )
+
+    _, metrics = trainer.step(make_batch())
+
+    assert "clip_ratio/region_mean" in metrics
+    assert "clip_ratio/low_mean" in metrics
+    assert "clip_ratio/high_mean" in metrics
+    assert "mean_ratio" in metrics
 
 
 def test_trainer_rejects_unimplemented_async_and_vllm_flags() -> None:
@@ -388,18 +457,7 @@ def test_trainer_rejects_unimplemented_async_and_vllm_flags() -> None:
         "verifier": MinimalVerifier(),
         "tokenizer": DummyTokenizer(),
         "layout": TrainableLayout(),
-        "rollout_orchestrator": StaticRollout(
-            RolloutBatch(
-                input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2]]], dtype=torch.long),
-                attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-                action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-                policy_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-                ref_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
-                rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
-                advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
-                metadata={"unique_response_ratio": 1.0, "responses": [["x", "y"]]},
-            )
-        ),
+        "rollout_orchestrator": StaticRollout(make_batch()),
     }
 
     for flag_name in ("use_async_rollout_workers", "use_async_trajectory_copy", "experimental_vllm_rollout"):
@@ -409,3 +467,40 @@ def test_trainer_rejects_unimplemented_async_and_vllm_flags() -> None:
         except NotImplementedError:
             continue
         raise AssertionError(f"{flag_name} should raise NotImplementedError when enabled.")
+
+
+def test_trainer_build_layout_passes_single_init_adapter_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeLoraConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class CapturingLayout(TrainableLayout):
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            super().__init__()
+
+    fake_peft = ModuleType("peft")
+    fake_peft.LoraConfig = FakeLoraConfig
+    monkeypatch.setitem(sys.modules, "peft", fake_peft)
+    monkeypatch.setattr(GRPOTrainer, "_build_tokenizer", lambda self: DummyTokenizer())
+    monkeypatch.setattr("agentrl.core.trainer.SharedWeightLayout", CapturingLayout)
+
+    init_adapter_path = "/tmp/init-adapter"
+    trainer = GRPOTrainer(
+        config=GRPOConfig(
+            model_name="fake/model",
+            steps=1,
+            init_adapter_path=init_adapter_path,
+            device="cpu",
+        ),
+        environment=MinimalEnvironment(),
+        verifier=MinimalVerifier(),
+        rollout_orchestrator=StaticRollout(make_batch()),
+    )
+
+    assert isinstance(trainer.layout, CapturingLayout)
+    assert captured["adapter_path"] == init_adapter_path

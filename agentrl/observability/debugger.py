@@ -86,9 +86,8 @@ class AgentRLDebugger:
         if responses:
             lines.append(f'Final responses: {responses[0]!r}')
 
-        flat_policy = batch.policy_logprobs.view(-1, batch.policy_logprobs.shape[-1])
-        flat_ref = batch.ref_logprobs.view(-1, batch.ref_logprobs.shape[-1])
-        flat_actions = batch.action_mask.view(-1, batch.action_mask.shape[-1])
+        flat_old_policy = batch.old_policy_logprobs.view(-1, batch.old_policy_logprobs.shape[-1])
+        flat_completion = batch.completion_mask.view(-1, batch.completion_mask.shape[-1])
         flat_ids = batch.input_ids.view(-1, batch.input_ids.shape[-1])
         flat_rewards = batch.rewards.reshape(-1)
         flat_advantages = batch.advantages.reshape(-1)
@@ -99,16 +98,13 @@ class AgentRLDebugger:
                 f"| advantage={float(flat_advantages[sequence_index].item()):+.2f}"
             )
             for token_position in range(flat_ids.shape[-1]):
-                if not bool(flat_actions[sequence_index, token_position].item()):
+                if not bool(flat_completion[sequence_index, token_position].item()):
                     continue
                 token_id = int(flat_ids[sequence_index, token_position].item())
-                policy_lp = float(flat_policy[sequence_index, token_position].item())
-                ref_lp = float(flat_ref[sequence_index, token_position].item())
-                ratio = policy_lp - ref_lp
-                marker = " *" if abs(ratio) > 1.0 else ""
+                old_policy_lp = float(flat_old_policy[sequence_index, token_position].item())
+                marker = " *" if abs(old_policy_lp) > 1.0 else ""
                 lines.append(
-                    f"  token={token_id} | log_prob(policy)={policy_lp:.4f} "
-                    f"| log_prob(ref)={ref_lp:.4f} | ratio={ratio:.4f}{marker}"
+                    f"  token={token_id} | log_prob(old_policy)={old_policy_lp:.4f}{marker}"
                 )
 
         if snapshot.metrics:
@@ -121,9 +117,8 @@ class AgentRLDebugger:
         return RolloutBatch(
             input_ids=batch.input_ids.detach().cpu(),
             attention_mask=batch.attention_mask.detach().cpu(),
-            action_mask=batch.action_mask.detach().cpu(),
-            policy_logprobs=batch.policy_logprobs.detach().cpu(),
-            ref_logprobs=batch.ref_logprobs.detach().cpu(),
+            completion_mask=batch.completion_mask.detach().cpu(),
+            old_policy_logprobs=batch.old_policy_logprobs.detach().cpu(),
             rewards=batch.rewards.detach().cpu(),
             advantages=batch.advantages.detach().cpu(),
             metadata=batch.metadata,
@@ -136,9 +131,8 @@ class AgentRLDebugger:
         return RolloutBatch(
             input_ids=empty_long,
             attention_mask=empty_long.clone(),
-            action_mask=empty_long.to(dtype=torch.bool),
-            policy_logprobs=empty_float,
-            ref_logprobs=empty_float.clone(),
+            completion_mask=empty_long.to(dtype=torch.bool),
+            old_policy_logprobs=empty_float,
             rewards=empty_reward,
             advantages=empty_reward.clone(),
             metadata={},

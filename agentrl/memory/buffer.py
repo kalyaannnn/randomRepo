@@ -122,9 +122,8 @@ class TrajectoryBuffer:
             "step": step,
             "input_ids": batch.input_ids.detach().to(device="cpu", dtype=token_dtype),
             "attention_mask": batch.attention_mask.detach().to(device="cpu", dtype=torch.uint8),
-            "action_mask": batch.action_mask.detach().to(device="cpu", dtype=torch.bool),
-            "policy_logprobs": batch.policy_logprobs.detach().to(device="cpu", dtype=torch.float16),
-            "ref_logprobs": batch.ref_logprobs.detach().to(device="cpu", dtype=torch.float16),
+            "completion_mask": batch.completion_mask.detach().to(device="cpu", dtype=torch.bool),
+            "old_policy_logprobs": batch.old_policy_logprobs.detach().to(device="cpu", dtype=torch.float16),
             "rewards": batch.rewards.detach().to(device="cpu", dtype=torch.float32),
             "advantages": batch.advantages.detach().to(device="cpu", dtype=torch.float32),
             "metadata": batch.metadata,
@@ -133,12 +132,15 @@ class TrajectoryBuffer:
     def _deserialize_batch(self, payload: dict[str, Any]) -> RolloutBatch:
         """Reconstruct a rollout batch from a serialized CPU payload."""
 
+        completion_mask = payload["completion_mask"] if "completion_mask" in payload else payload["action_mask"]
+        old_policy_logprobs = (
+            payload["old_policy_logprobs"] if "old_policy_logprobs" in payload else payload["policy_logprobs"]
+        )
         return RolloutBatch(
             input_ids=payload["input_ids"].to(dtype=torch.long),
             attention_mask=payload["attention_mask"].to(dtype=torch.long),
-            action_mask=payload["action_mask"].to(dtype=torch.bool),
-            policy_logprobs=payload["policy_logprobs"].to(dtype=torch.float32),
-            ref_logprobs=payload["ref_logprobs"].to(dtype=torch.float32),
+            completion_mask=completion_mask.to(dtype=torch.bool),
+            old_policy_logprobs=old_policy_logprobs.to(dtype=torch.float32),
             rewards=payload["rewards"].to(dtype=torch.float32),
             advantages=payload["advantages"].to(dtype=torch.float32),
             metadata=payload["metadata"],
@@ -150,9 +152,8 @@ class TrajectoryBuffer:
         return RolloutBatch(
             input_ids=batch.input_ids.to(device),
             attention_mask=batch.attention_mask.to(device),
-            action_mask=batch.action_mask.to(device),
-            policy_logprobs=batch.policy_logprobs.to(device),
-            ref_logprobs=batch.ref_logprobs.to(device),
+            completion_mask=batch.completion_mask.to(device),
+            old_policy_logprobs=batch.old_policy_logprobs.to(device),
             rewards=batch.rewards.to(device),
             advantages=batch.advantages.to(device),
             metadata=batch.metadata,

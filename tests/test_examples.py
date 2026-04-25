@@ -25,9 +25,7 @@ def test_readme_mentions_official_byod_api() -> None:
 
     assert "BYODRecord" in readme
     assert "make_single_turn_task" in readme
-    assert "1.54x faster per step" in readme
-    assert "1.55x higher throughput" in readme
-    assert "2842 MB less rollout VRAM" in readme
+    assert "TRL-compatible clipped GRPO path" in readme
     assert "codeDemo.ipynb" in readme
 
     for link in links:

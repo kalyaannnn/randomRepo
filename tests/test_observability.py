@@ -16,9 +16,8 @@ def make_batch() -> RolloutBatch:
     return RolloutBatch(
         input_ids=torch.tensor([[[10, 11, 12], [20, 21, 22]]], dtype=torch.long),
         attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
-        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
-        policy_logprobs=torch.tensor([[[0.0, -0.1, -0.2], [0.0, -0.3, -0.4]]], dtype=torch.float32),
-        ref_logprobs=torch.tensor([[[0.0, -1.6, -0.2], [0.0, -0.3, -0.4]]], dtype=torch.float32),
+        completion_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
+        old_policy_logprobs=torch.tensor([[[0.0, -1.6, -0.2], [0.0, -0.3, -0.4]]], dtype=torch.float32),
         rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
         advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
         metadata={
@@ -47,9 +46,8 @@ def test_replay_buffer_show_and_compare_render_saved_trajectories(tmp_path: Path
     batch_b = RolloutBatch(
         input_ids=batch_b.input_ids,
         attention_mask=batch_b.attention_mask,
-        action_mask=batch_b.action_mask,
-        policy_logprobs=batch_b.policy_logprobs,
-        ref_logprobs=batch_b.ref_logprobs,
+        completion_mask=batch_b.completion_mask,
+        old_policy_logprobs=batch_b.old_policy_logprobs,
         rewards=batch_b.rewards,
         advantages=batch_b.advantages,
         metadata={"prompts": ["Solve: 3x + 7 = 22"], "responses": [["x = 5", "x = 4"]]},
@@ -87,9 +85,8 @@ def test_debugger_captures_low_reward_and_renders_token_diffs() -> None:
     low_reward_batch = RolloutBatch(
         input_ids=batch.input_ids,
         attention_mask=batch.attention_mask,
-        action_mask=batch.action_mask,
-        policy_logprobs=batch.policy_logprobs,
-        ref_logprobs=batch.ref_logprobs,
+        completion_mask=batch.completion_mask,
+        old_policy_logprobs=batch.old_policy_logprobs,
         rewards=torch.tensor([[0.1, 0.0]], dtype=torch.float32),
         advantages=batch.advantages,
         metadata=batch.metadata,
@@ -100,7 +97,7 @@ def test_debugger_captures_low_reward_and_renders_token_diffs() -> None:
 
     assert "Debug Step 4" in debug_text
     assert "reward=0.10" in debug_text
-    assert "ratio=" in debug_text
+    assert "log_prob(old_policy)=" in debug_text
     assert "*" in debug_text
 
 
