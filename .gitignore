@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 checkpoints/
 .DS_Store
+notebooks/agentrl_trl_15b_t4_demo.ipynb

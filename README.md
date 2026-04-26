@@ -173,7 +173,6 @@ Useful entry points:
 - [docs/open_source_demo.md](docs/open_source_demo.md)
 - [docs/bring_your_own_task.md](docs/bring_your_own_task.md)
 - [notebooks/codeDemo.ipynb](notebooks/codeDemo.ipynb)
-- [notebooks/agentrl_trl_15b_t4_demo.ipynb](notebooks/agentrl_trl_15b_t4_demo.ipynb)
 
 For the single-turn MBPP comparison harness:
 
